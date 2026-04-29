@@ -270,6 +270,11 @@ class TraceProfile:
     num_steps: int = 0
     margin_pct: float = 0.15
     block_boundaries: list[int] = field(default_factory=list)
+    time_min: float = 0.0
+    time_max: float = 0.0
+    time_initial: float = 0.0
+    time_min_delta: float = 0.0
+    time_max_delta: float = 0.0
 
     def variable_names(self) -> list[str]:
         return sorted(self.variables.keys())
@@ -301,6 +306,17 @@ def profile_trace(trace: list[dict[str, Any]], margin_pct: float = 0.15) -> Trac
     block_reps = [trace[i] for i in block_starts]
     prof = TraceProfile(num_steps=len(trace), margin_pct=margin_pct,
                         block_boundaries=block_starts)
+
+    times = [s["timestamp"] for s in trace if "timestamp" in s]
+    if times:
+        prof.time_min = min(times)
+        prof.time_max = max(times)
+        prof.time_initial = times[0]
+        rep_times = [trace[i]["timestamp"] for i in block_starts if "timestamp" in trace[i]]
+        time_deltas = [rep_times[i + 1] - rep_times[i] for i in range(len(rep_times) - 1)]
+        if time_deltas:
+            prof.time_min_delta = min(time_deltas)
+            prof.time_max_delta = max(time_deltas)
 
     for name in sorted(keys):
         first_val = next((s[name] for s in trace if name in s), None)
@@ -389,10 +405,12 @@ def _safe(name: str) -> str:
 class GenericTransitionSystem:
 
     def __init__(self, profile: TraceProfile, skip_constant: bool = True,
-                 exact_initial: bool = False, use_invariants: bool = True):
+                 exact_initial: bool = False, use_invariants: bool = True,
+                 model_time: bool = False):
         self.profile = profile
         self.exact_initial = exact_initial
         self.use_invariants = use_invariants
+        self.model_time = model_time
         if skip_constant:
             self.var_names = [n for n in profile.variable_names()
                               if not profile.variables[n].is_constant]
@@ -417,15 +435,22 @@ class GenericTransitionSystem:
                 state[name] = Real(f"{base}_{t}")
         for name, val in self.constants.items():
             state[name] = RealVal(val)
+        if self.model_time:
+            state["_t"] = Real(f"_t_{t}")
         return state
 
     def symbolic_states_at(self, timestamps: Sequence[float]) -> list[dict[str, Any]]:
         path = []
         for i, t in enumerate(timestamps):
             s = self.make_state(i)
-            s["_t"] = t
+            s["_t_concrete"] = float(t)
             path.append(s)
         return path
+
+    def pin_time(self, path: list[dict], timestamps: Sequence[float]) -> list:
+        if not self.model_time:
+            raise ValueError("pin_time requires model_time=True")
+        return [path[i]["_t"] == float(timestamps[i]) for i in range(len(timestamps))]
 
     def initial_constraints(self, s0: dict) -> list:
         constraints = []
@@ -446,6 +471,14 @@ class GenericTransitionSystem:
                 margin = self._margin(vp)
                 constraints.append(s0[name] >= float(vp.initial) - margin)
                 constraints.append(s0[name] <= float(vp.initial) + margin)
+        if self.model_time:
+            ti = self.profile.time_initial
+            if self.exact_initial:
+                constraints.append(s0["_t"] == ti)
+            else:
+                tm = self._time_margin()
+                constraints.append(s0["_t"] >= ti - tm)
+                constraints.append(s0["_t"] <= ti + tm)
         return constraints
 
     def invariant_constraints(self, s: dict) -> list:
@@ -460,6 +493,10 @@ class GenericTransitionSystem:
                     margin = self._margin(vp)
                     constraints.append(x >= vp.min_val - margin)
                     constraints.append(x <= vp.max_val + margin)
+        if self.model_time and self.use_invariants:
+            tm = self._time_margin()
+            constraints.append(s["_t"] >= self.profile.time_min - tm)
+            constraints.append(s["_t"] <= self.profile.time_max + tm)
         for inv_fn in self._custom_invariants:
             constraints.append(inv_fn(s))
         return constraints
@@ -478,10 +515,22 @@ class GenericTransitionSystem:
                 constraints.append(delta >= 0)
             if vp.is_monotone_dec:
                 constraints.append(delta <= 0)
+        if self.model_time:
+            dt = s_next["_t"] - s_curr["_t"]
+            constraints.append(dt >= 0)
+            tm = self._time_margin()
+            dmin = max(self.profile.time_min_delta - tm, 0.0)
+            dmax = self.profile.time_max_delta + tm
+            if dmax > 0:
+                constraints.append(dt >= dmin)
+                constraints.append(dt <= dmax)
         return constraints
 
     def _margin(self, vp: VarProfile) -> float:
         return max((vp.max_val - vp.min_val) * self.profile.margin_pct, 0.01)
+
+    def _time_margin(self) -> float:
+        return max((self.profile.time_max - self.profile.time_min) * self.profile.margin_pct, 0.01)
 
     def make_path(self, k: int) -> list[dict]:
         return [self.make_state(t) for t in range(k + 1)]
@@ -672,7 +721,7 @@ class GenericTransitionSystem:
     def _eval_state(self, model, s: dict) -> dict[str, Any]:
         vals: dict[str, Any] = {}
         for key, var in s.items():
-            if key == "_t":
+            if key == "_t_concrete":
                 vals[key] = var
             elif isinstance(var, tuple):
                 vals[key] = tuple(self._eval_one(model, x) for x in var)
