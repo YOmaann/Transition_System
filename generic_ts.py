@@ -31,16 +31,18 @@ StateFn = Callable[[dict], FNode]
 def _real(value: float | int) -> FNode:
     return Real(Fraction(str(value)))
 
-
+# Generic transition system built from a trace profile.
 class GenericTransitionSystem:
 
     def __init__(self, profile: TraceProfile, skip_constant: bool = True,
                  exact_initial: bool = False, use_invariants: bool = True,
                  model_time: bool = False):
-        self.profile = profile
-        self.exact_initial = exact_initial
-        self.use_invariants = use_invariants
-        self.model_time = model_time
+        self.profile = profile # trace profile containing variable profiles.
+        self.exact_initial = exact_initial # whether to enforce exact initial values.
+        self.use_invariants = use_invariants # add invariant constraints based on variable ranges (constants and booleans are always invariant).
+        self.model_time = model_time # is time needs to be modeled in a variable.
+
+        # you can skip constants if you want.
         if skip_constant:
             self.var_names = [n for n in profile.variable_names()
                               if not profile.variables[n].is_constant]
@@ -172,6 +174,7 @@ class GenericTransitionSystem:
     def make_path(self, k: int) -> list[dict]:
         return [self.make_state(t) for t in range(k + 1)]
 
+    # returns transitions constraints for the entire path (invariant and initial included.)
     def path_constraints(self, path: list[dict]) -> list:
         c = []
         c.extend(self.initial_constraints(path[0]))
@@ -181,15 +184,16 @@ class GenericTransitionSystem:
             c.extend(self.transition_constraints(path[i], path[i + 1]))
         return c
 
+    # create propositions based on variable profiles. 
     def _build_propositions(self):
         for name, vp in self.profile.variables.items():
             if vp.is_constant:
                 continue
-            base = _safe(name)
+            base = _safe(name) # sanitize name.
             if vp.is_list:
                 if vp.is_boolean:
                     self.propositions[f"{base}_any_true"] = (
-                        lambda s, n=name: Or(*[GE(x, _real(0.5)) for x in s[n]]))
+                        lambda s, n=name: Or(*[GE(x, _real(0.5)) for x in s[n]])) # if any element in the list is true (>= 0.5), then the proposition holds.
                     self.propositions[f"{base}_all_true"] = (
                         lambda s, n=name: And(*[GE(x, _real(0.5)) for x in s[n]]))
                 else:
@@ -473,18 +477,24 @@ class GenericTransitionSystem:
         print()
 
     # get output in SMT-LIB format for use with other tools.
-    def to_smtlib(self, path: list[dict]) -> str:
-        decls = [] # declarations for all variables in the path
-        for s in path:
+    def to_smtlib(self, path: str, bound: int = 25):
+        trace = self.make_path(bound)
+
+        decls = set() # declarations for all variables in the path
+        for s in trace:
             for var in s.values():
+                # skip floats
+                if isinstance(var, float):
+                    continue
                 if isinstance(var, tuple):
                     for x in var:
-                        decls.append(f"(declare-fun {x} () Real)")
-                else:
-                    decls.append(f"(declare-fun {var} () Real)")
+                        decls.add(f"(declare-fun {x} () Real)")
+                elif isinstance(var, FNode) and var.is_symbol():
+                    decls.add(f"(declare-fun {var} () Real)")
 
-        constraints = self.path_constraints(path)
+        constraints = self.path_constraints(trace)
         constraints_str = "\n  ".join(c.serialize() for c in constraints)
 
         # set languauge as quantifier-free linear real arithmetic and assert all constraints. and check for sat.
-        return f"(set-logic QF_LRA)\n{chr(10).join(decls)}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n"
+        with open(path, "w") as f:
+            f.write( f"(set-logic QF_LRA)\n{chr(10).join(decls)}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n")
