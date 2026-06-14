@@ -1,11 +1,18 @@
+from fractions import Fraction
+import json
+
 from generic_ts import GenericTransitionSystem
 from trace import TraceOptions, build_trace
 from profiles import profile_trace
-import json
-from z3 import *
+from pysmt.shortcuts import And, GE, LE, Or, Real
+
+
+def _real(value: float | int):
+    return Real(Fraction(str(value)))
 
 
 # load a json file and build a transition system with profiles
+# returns a GenericTransitionSystem built from the trace data in the json file.
 def from_json(path: str, opts: TraceOptions | None = None,
               margin_pct: float = 0.15) -> GenericTransitionSystem:
     if opts is None:
@@ -35,7 +42,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             f"G({short} in [{vp.min_val:.1f}, {vp.max_val:.1f}])",
             lambda p, n=name, lo=vp.min_val, hi=vp.max_val:
                 ts.ltl_G(p, lambda s, n=n, lo=lo, hi=hi:
-                         And(s[n] >= lo, s[n] <= hi)),
+                         And(GE(s[n], _real(lo)), LE(s[n], _real(hi)))),
             bound,
         )
 
@@ -51,7 +58,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             ts.check(
                 f"G({short}[t+1] >= {short}[t]) -- monotone increasing",
                 lambda p, n=name: And(*[
-                    p[i + 1][n] >= p[i][n] for i in range(len(p) - 1)
+                    GE(p[i + 1][n], p[i][n]) for i in range(len(p) - 1)
                 ]),
                 bound,
             )
@@ -59,7 +66,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             ts.check(
                 f"G({short}[t+1] <= {short}[t]) -- monotone decreasing",
                 lambda p, n=name: And(*[
-                    p[i + 1][n] <= p[i][n] for i in range(len(p) - 1)
+                    LE(p[i + 1][n], p[i][n]) for i in range(len(p) - 1)
                 ]),
                 bound,
             )
@@ -73,7 +80,9 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             short = ts._short_name(name)
             ts.check(
                 f"F({short}) -- eventually true",
-                lambda p, n=name: ts.ltl_F(p, lambda s, n=n: s[n] >= 0.5),
+                lambda p, n=name: ts.ltl_F(
+                    p, lambda s, n=n: GE(s[n], _real(0.5))
+                ),
                 bound,
             )
 
@@ -88,6 +97,6 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
         ts.check_reachable(
             f"Can {short} reach its max ({vp.max_val:.2f})?",
             lambda p, n=name, mx=vp.max_val:
-                Or(*[p[i][n] >= mx for i in range(len(p))]),
+                Or(*[GE(p[i][n], _real(mx)) for i in range(len(p))]),
             bound,
         )

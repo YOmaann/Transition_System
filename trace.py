@@ -5,20 +5,28 @@ from dataclasses import dataclass
 from itertools import product
 from typing import Any, Sequence, Literal
 
+# options for how to handle multiple arrays while flatenning records.
 class ArrayMode(Enum):
     TRUNCATE = "truncate"
     CROSSPRODUCT = "crossproduct"
     INTACT = "intact"
 
 
+# options for building traces.
+# Array Mode has three options :
+# This is used to deal with arrays in the data when constructing trace.
+#    1. truncate: flatten arrays by truncating them to fixed length default 2. (arrays are preserved)
+#    2. crossproduct: flatten arrays by taking cross product of all elements. (can lead to explosion/ arrays are not preserved, each is reduced to a single element)
+#    3. intact: keep arrays as tuples in the flattened trace.
 @dataclass
 class TraceOptions:
     array_mode: ArrayMode = ArrayMode.TRUNCATE
-    max_list_items: int = 2
-    tolerance: float = float("inf")
+    max_list_items: int = 2 # default max number of items in a flattened list.
+    tolerance: float = float("inf") # tolerance to match timestamps when looking for nearest state.
     timestamps: Sequence[float] | None = None
     missing_policy: Literal["drop", "nan"] = "drop"
 
+    # validate the given options.
     def __post_init__(self):
         if self.tolerance < 0:
             raise ValueError("tolerance must be non-negative")
@@ -26,6 +34,7 @@ class TraceOptions:
             raise ValueError(f"unknown missing_policy: {self.missing_policy}")
 
 
+# discover the lists with timestamps. 
 def discover_time_series(data: dict) -> dict[str, list[dict]]:
     series: dict[str, list[dict]] = {}
     for key, val in data.items():
@@ -37,20 +46,32 @@ def discover_time_series(data: dict) -> dict[str, list[dict]]:
     return series
 
 
+# do binary search to find the nearest entry by timestamp. 
+# introduced strategies to find nearest or nearest at the left side or nearest at the right side.
 def nearest_by_time(entries: list[dict], t: float,
-                    tolerance: float = float("inf")) -> dict | None:
+                    tolerance: float = float("inf"), strategy : Literal["default", "left", "right"] = "default") -> dict | None:
     if not entries:
         return None
+    
     lo, hi = 0, len(entries) - 1
     while lo < hi:
         mid = (lo + hi) // 2
+
+        # find the nearest element to the right of t
         if entries[mid]["timestamp"] < t:
             lo = mid + 1
         else:
             hi = mid
     best = lo
-    if lo > 0 and abs(entries[lo - 1]["timestamp"] - t) < abs(entries[lo]["timestamp"] - t):
+    if lo > 0 and abs(entries[lo - 1]["timestamp"] - t) < abs(entries[lo]["timestamp"] - t) and strategy == "default":
         best = lo - 1
+    elif strategy == "left":
+        if lo > 0 and entries[lo]["timestamp"] > t:
+            best = lo - 1
+        else:
+            return None
+
+    
     if abs(entries[best]["timestamp"] - t) > tolerance:
         return None
     return entries[best]
@@ -63,6 +84,10 @@ def _split_numeric_string(s: str) -> list[float] | None:
     return None
 
 
+# strategies to merge multiple lists. raw timestamped data into flat sequence of states.
+
+
+# strategy 1: truncate -> 
 def _flatten_truncate(obj: Any, prefix: str, max_list_items: int) -> dict[str, float | str]:
     result: dict[str, float | str] = {}
     if isinstance(obj, dict):
@@ -157,6 +182,7 @@ def _flatten_intact(obj: Any, prefix: str) -> dict[str, Any]:
     return result
 
 
+# flatten records based on the ArrayOptionsSelected.
 def flatten_record(obj: Any, prefix: str = "",
                    opts: TraceOptions | None = None) -> list[dict[str, Any]]:
     if opts is None:
@@ -170,6 +196,7 @@ def flatten_record(obj: Any, prefix: str = "",
     raise ValueError(f"unknown array_mode: {opts.array_mode}")
 
 
+# extract metadata (non-timestamped fileds) from the data. flatten them with prefix "meta".
 def _metadata_dict(data: dict, opts: TraceOptions) -> dict[str, Any]:
     meta: dict[str, Any] = {}
     for key, val in data.items():
@@ -191,7 +218,7 @@ def states_at_one(data: dict, t: float,
                   opts: TraceOptions | None = None) -> list[dict[str, Any]]:
     if opts is None:
         opts = TraceOptions()
-    series = discover_time_series(data)
+    series = discover_time_series(data) # discover lists with timestamps.
     metadata = _metadata_dict(data, opts)
 
     per_stream: list[list[dict[str, Any]]] = []
@@ -212,6 +239,7 @@ def states_at_one(data: dict, t: float,
     return states
 
 
+# create a state from timestamps.
 def states_at(data: dict, timestamps: Sequence[float],
               opts: TraceOptions | None = None) -> list[dict[str, Any]]:
     if opts is None:
@@ -222,6 +250,7 @@ def states_at(data: dict, timestamps: Sequence[float],
     return trace
 
 
+# given traceOptions build a trace by calling states_at.
 def build_trace(data: dict, opts: TraceOptions | None = None) -> list[dict[str, Any]]:
     if opts is None:
         opts = TraceOptions()
@@ -233,11 +262,12 @@ def extract_flat_trace(data: dict) -> list[dict[str, Any]]:
     return build_trace(data, TraceOptions())
 
 
-def _block_starts(trace: list[dict[str, Any]]) -> list[int]:
+# get unique indices where timestamp changes. ingnore dublicate time stamps.
+def _block_starts(trace: list[dict[str, Any]], delta: float = 1e-9) -> list[int]:
     if not trace:
         return []
     starts = [0]
     for i in range(1, len(trace)):
-        if trace[i].get("timestamp") != trace[i - 1].get("timestamp"):
+        if abs(trace[i].get("timestamp") - trace[i - 1].get("timestamp")) >= delta:
             starts.append(i)
     return starts

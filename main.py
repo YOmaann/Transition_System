@@ -26,4 +26,5 @@ if __name__ == "__main__":
 
     print(f"Loading: {json_path}")
     ts = from_json(json_path)
-    run_standard_checks(ts, bound=bound)
+    # run_standard_checks(ts, bound=bound)
+    ts.to_smtlib("output.smt2")

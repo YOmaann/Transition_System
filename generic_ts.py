@@ -56,6 +56,7 @@ class GenericTransitionSystem:
         self._custom_invariants: list[StateFn] = []
         self._build_propositions()
 
+    # make state variables for a given timestamp t. vars are named {varname}_{t} for scalars and {varname}_{i}_{t} for lists}
     def make_state(self, t: int) -> dict[str, Any]:
         state: dict[str, Any] = {}
         for name in self.var_names:
@@ -73,6 +74,7 @@ class GenericTransitionSystem:
             state["_t"] = Symbol(f"_t_{t}", REAL)
         return state
 
+    # make states and add concrete (python) timestamp for each state in the path.
     def symbolic_states_at(self, timestamps: Sequence[float]) -> list[dict[str, Any]]:
         path = []
         for i, t in enumerate(timestamps):
@@ -81,6 +83,7 @@ class GenericTransitionSystem:
             path.append(s)
         return path
 
+    # for each state in path, make time variable equal to the given timestamp.
     def pin_time(self, path: list[dict], timestamps: Sequence[float]) -> list:
         if not self.model_time:
             raise ValueError("pin_time requires model_time=True")
@@ -89,8 +92,10 @@ class GenericTransitionSystem:
             for i in range(len(timestamps))
         ]
 
+    # create initial constraints based on the initial value in the profile.
     def initial_constraints(self, s0: dict) -> list:
         constraints = []
+        # for each variable in the state.
         for name in self.var_names:
             vp = self.profile.variables[name]
             if vp.is_list:
@@ -103,11 +108,15 @@ class GenericTransitionSystem:
                         constraints.append(GE(x, _real(float(init[i]) - margin)))
                         constraints.append(LE(x, _real(float(init[i]) + margin)))
             elif self.exact_initial or vp.is_boolean:
-                constraints.append(Equals(s0[name], _real(vp.initial)))
+                # exact initial - initial values should be exact
+                constraints.append(Equals(s0[name], _real(vp.initial))) # add variable with initial value 
             else:
+                # if not exact initial - initial values should not be exact.
                 margin = self._margin(vp)
                 constraints.append(GE(s0[name], _real(float(vp.initial) - margin)))
                 constraints.append(LE(s0[name], _real(float(vp.initial) + margin)))
+
+        # add time as a variable
         if self.model_time:
             ti = self.profile.time_initial
             if self.exact_initial:
@@ -118,6 +127,7 @@ class GenericTransitionSystem:
                 constraints.append(LE(s0["_t"], _real(ti + tm)))
         return constraints
 
+    # add invariant constraints if provided.
     def invariant_constraints(self, s: dict) -> list:
         constraints = []
         for name in self.var_names:
@@ -143,6 +153,7 @@ class GenericTransitionSystem:
     def add_invariant(self, fn: StateFn):
         self._custom_invariants.append(fn)
 
+    # add transition constraints based on monotonicity and time deltas.
     def transition_constraints(self, s_curr: dict, s_next: dict) -> list:
         constraints = []
         for name in self.var_names:
@@ -151,12 +162,12 @@ class GenericTransitionSystem:
                 continue
             delta = Minus(s_next[name], s_curr[name])
             if vp.is_monotone_inc:
-                constraints.append(GE(delta, _real(0)))
+                constraints.append(GE(delta, _real(0))) # increasing value constraint
             if vp.is_monotone_dec:
-                constraints.append(LE(delta, _real(0)))
+                constraints.append(LE(delta, _real(0))) # decreasing value constraint
         if self.model_time:
             dt = Minus(s_next["_t"], s_curr["_t"])
-            constraints.append(GE(dt, _real(0)))
+            constraints.append(GE(dt, _real(0))) # time must advance
             tm = self._time_margin()
             dmin = max(self.profile.time_min_delta - tm, 0.0)
             dmax = self.profile.time_max_delta + tm
