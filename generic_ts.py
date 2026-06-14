@@ -471,3 +471,20 @@ class GenericTransitionSystem:
             print(f"    {short:<35} {vp.min_val:>10.3f} {vp.max_val:>10.3f} "
                   f"{vp.min_delta:>10.4f} {vp.max_delta:>10.4f} {float(init_disp):>10.3f}")
         print()
+
+    # get output in SMT-LIB format for use with other tools.
+    def to_smtlib(self, path: list[dict]) -> str:
+        decls = [] # declarations for all variables in the path
+        for s in path:
+            for var in s.values():
+                if isinstance(var, tuple):
+                    for x in var:
+                        decls.append(f"(declare-fun {x} () Real)")
+                else:
+                    decls.append(f"(declare-fun {var} () Real)")
+
+        constraints = self.path_constraints(path)
+        constraints_str = "\n  ".join(c.serialize() for c in constraints)
+
+        # set languauge as quantifier-free linear real arithmetic and assert all constraints. and check for sat.
+        return f"(set-logic QF_LRA)\n{chr(10).join(decls)}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n"
