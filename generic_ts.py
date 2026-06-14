@@ -1,10 +1,36 @@
+from fractions import Fraction
 from typing import Any, Callable, Sequence
+
+from pysmt.exceptions import SolverReturnedUnknownResultError
+from pysmt.fnode import FNode
+from pysmt.shortcuts import (
+    And,
+    Bool,
+    Equals,
+    GE,
+    GT,
+    Implies,
+    LE,
+    LT,
+    Minus,
+    Not,
+    Or,
+    Real,
+    Solver,
+    Symbol,
+)
+from pysmt.typing import REAL
+
 from profiles import VarProfile, TraceProfile
 from utils.helper import _safe
-from z3 import *
 
 
-StateFn = Callable[[dict], Any]
+StateFn = Callable[[dict], FNode]
+
+
+def _real(value: float | int) -> FNode:
+    return Real(Fraction(str(value)))
+
 
 class GenericTransitionSystem:
 
@@ -34,13 +60,15 @@ class GenericTransitionSystem:
             vp = self.profile.variables[name]
             base = _safe(name)
             if vp.is_list:
-                state[name] = tuple(Real(f"{base}_{i}_{t}") for i in range(vp.list_len))
+                state[name] = tuple(
+                    Symbol(f"{base}_{i}_{t}", REAL) for i in range(vp.list_len)
+                )
             else:
-                state[name] = Real(f"{base}_{t}")
+                state[name] = Symbol(f"{base}_{t}", REAL)
         for name, val in self.constants.items():
-            state[name] = RealVal(val)
+            state[name] = _real(val)
         if self.model_time:
-            state["_t"] = Real(f"_t_{t}")
+            state["_t"] = Symbol(f"_t_{t}", REAL)
         return state
 
     def symbolic_states_at(self, timestamps: Sequence[float]) -> list[dict[str, Any]]:
@@ -54,7 +82,10 @@ class GenericTransitionSystem:
     def pin_time(self, path: list[dict], timestamps: Sequence[float]) -> list:
         if not self.model_time:
             raise ValueError("pin_time requires model_time=True")
-        return [path[i]["_t"] == float(timestamps[i]) for i in range(len(timestamps))]
+        return [
+            Equals(path[i]["_t"], _real(timestamps[i]))
+            for i in range(len(timestamps))
+        ]
 
     def initial_constraints(self, s0: dict) -> list:
         constraints = []
@@ -64,25 +95,25 @@ class GenericTransitionSystem:
                 init = vp.initial if isinstance(vp.initial, tuple) else (float(vp.initial),) * vp.list_len
                 for i, x in enumerate(s0[name]):
                     if self.exact_initial:
-                        constraints.append(x == float(init[i]))
+                        constraints.append(Equals(x, _real(init[i])))
                     else:
                         margin = self._margin(vp)
-                        constraints.append(x >= float(init[i]) - margin)
-                        constraints.append(x <= float(init[i]) + margin)
+                        constraints.append(GE(x, _real(float(init[i]) - margin)))
+                        constraints.append(LE(x, _real(float(init[i]) + margin)))
             elif self.exact_initial or vp.is_boolean:
-                constraints.append(s0[name] == float(vp.initial))
+                constraints.append(Equals(s0[name], _real(vp.initial)))
             else:
                 margin = self._margin(vp)
-                constraints.append(s0[name] >= float(vp.initial) - margin)
-                constraints.append(s0[name] <= float(vp.initial) + margin)
+                constraints.append(GE(s0[name], _real(float(vp.initial) - margin)))
+                constraints.append(LE(s0[name], _real(float(vp.initial) + margin)))
         if self.model_time:
             ti = self.profile.time_initial
             if self.exact_initial:
-                constraints.append(s0["_t"] == ti)
+                constraints.append(Equals(s0["_t"], _real(ti)))
             else:
                 tm = self._time_margin()
-                constraints.append(s0["_t"] >= ti - tm)
-                constraints.append(s0["_t"] <= ti + tm)
+                constraints.append(GE(s0["_t"], _real(ti - tm)))
+                constraints.append(LE(s0["_t"], _real(ti + tm)))
         return constraints
 
     def invariant_constraints(self, s: dict) -> list:
@@ -92,15 +123,17 @@ class GenericTransitionSystem:
             xs = s[name] if vp.is_list else (s[name],)
             for x in xs:
                 if vp.is_boolean:
-                    constraints.append(Or(x == 0.0, x == 1.0))
+                    constraints.append(
+                        Or(Equals(x, _real(0)), Equals(x, _real(1)))
+                    )
                 elif self.use_invariants:
                     margin = self._margin(vp)
-                    constraints.append(x >= vp.min_val - margin)
-                    constraints.append(x <= vp.max_val + margin)
+                    constraints.append(GE(x, _real(vp.min_val - margin)))
+                    constraints.append(LE(x, _real(vp.max_val + margin)))
         if self.model_time and self.use_invariants:
             tm = self._time_margin()
-            constraints.append(s["_t"] >= self.profile.time_min - tm)
-            constraints.append(s["_t"] <= self.profile.time_max + tm)
+            constraints.append(GE(s["_t"], _real(self.profile.time_min - tm)))
+            constraints.append(LE(s["_t"], _real(self.profile.time_max + tm)))
         for inv_fn in self._custom_invariants:
             constraints.append(inv_fn(s))
         return constraints
@@ -114,20 +147,20 @@ class GenericTransitionSystem:
             vp = self.profile.variables[name]
             if vp.is_constant or vp.is_list:
                 continue
-            delta = s_next[name] - s_curr[name]
+            delta = Minus(s_next[name], s_curr[name])
             if vp.is_monotone_inc:
-                constraints.append(delta >= 0)
+                constraints.append(GE(delta, _real(0)))
             if vp.is_monotone_dec:
-                constraints.append(delta <= 0)
+                constraints.append(LE(delta, _real(0)))
         if self.model_time:
-            dt = s_next["_t"] - s_curr["_t"]
-            constraints.append(dt >= 0)
+            dt = Minus(s_next["_t"], s_curr["_t"])
+            constraints.append(GE(dt, _real(0)))
             tm = self._time_margin()
             dmin = max(self.profile.time_min_delta - tm, 0.0)
             dmax = self.profile.time_max_delta + tm
             if dmax > 0:
-                constraints.append(dt >= dmin)
-                constraints.append(dt <= dmax)
+                constraints.append(GE(dt, _real(dmin)))
+                constraints.append(LE(dt, _real(dmax)))
         return constraints
 
     def _margin(self, vp: VarProfile) -> float:
@@ -156,30 +189,39 @@ class GenericTransitionSystem:
             if vp.is_list:
                 if vp.is_boolean:
                     self.propositions[f"{base}_any_true"] = (
-                        lambda s, n=name: Or(*[x >= 0.5 for x in s[n]]))
+                        lambda s, n=name: Or(*[GE(x, _real(0.5)) for x in s[n]]))
                     self.propositions[f"{base}_all_true"] = (
-                        lambda s, n=name: And(*[x >= 0.5 for x in s[n]]))
+                        lambda s, n=name: And(*[GE(x, _real(0.5)) for x in s[n]]))
                 else:
                     self.propositions[f"{base}_any_high"] = (
-                        lambda s, n=name, th=vp.q75: Or(*[x > th for x in s[n]]))
+                        lambda s, n=name, th=vp.q75: Or(
+                            *[GT(x, _real(th)) for x in s[n]]
+                        ))
                     self.propositions[f"{base}_all_low"] = (
-                        lambda s, n=name, th=vp.q25: And(*[x < th for x in s[n]]))
+                        lambda s, n=name, th=vp.q25: And(
+                            *[LT(x, _real(th)) for x in s[n]]
+                        ))
                     if vp.min_val <= 0 <= vp.max_val:
                         eps = max((vp.max_val - vp.min_val) * 0.05, 0.01)
                         self.propositions[f"{base}_any_near_zero"] = (
-                            lambda s, n=name, e=eps: Or(*[And(x >= -e, x <= e) for x in s[n]]))
+                            lambda s, n=name, e=eps: Or(*[
+                                And(GE(x, _real(-e)), LE(x, _real(e)))
+                                for x in s[n]
+                            ]))
             elif vp.is_boolean:
-                self.propositions[f"{base}_true"] = lambda s, n=name: s[n] >= 0.5
-                self.propositions[f"{base}_false"] = lambda s, n=name: s[n] < 0.5
+                self.propositions[f"{base}_true"] = lambda s, n=name: GE(s[n], _real(0.5))
+                self.propositions[f"{base}_false"] = lambda s, n=name: LT(s[n], _real(0.5))
             else:
                 self.propositions[f"{base}_high"] = (
-                    lambda s, n=name, th=vp.q75: s[n] > th)
+                    lambda s, n=name, th=vp.q75: GT(s[n], _real(th)))
                 self.propositions[f"{base}_low"] = (
-                    lambda s, n=name, th=vp.q25: s[n] < th)
+                    lambda s, n=name, th=vp.q25: LT(s[n], _real(th)))
                 if vp.min_val <= 0 <= vp.max_val:
                     eps = max((vp.max_val - vp.min_val) * 0.05, 0.01)
                     self.propositions[f"{base}_near_zero"] = (
-                        lambda s, n=name, e=eps: And(s[n] >= -e, s[n] <= e))
+                        lambda s, n=name, e=eps: And(
+                            GE(s[n], _real(-e)), LE(s[n], _real(e))
+                        ))
 
     def get_prop(self, prop_name: str) -> StateFn:
         if prop_name not in self.propositions:
@@ -230,27 +272,29 @@ class GenericTransitionSystem:
         for j in range(len(path)):
             q_at_j = trigger_fn(path[j])
             p_false_before = (And(*[Not(forbidden_fn(path[i])) for i in range(j)])
-                              if j > 0 else BoolVal(True))
+                              if j > 0 else Bool(True))
             clauses.append(And(q_at_j, p_false_before))
         return Or(*clauses)
 
     def check(self, name: str, phi_fn: Callable, bound: int = 25,
               extra_constraints: Callable | None = None, timeout_ms: int = 30000):
         path = self.make_path(bound)
-        solver = Solver()
-        solver.set("timeout", timeout_ms)
-        solver.add(self.path_constraints(path))
+        solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
+        solver.add_assertions(self.path_constraints(path))
         if extra_constraints:
-            solver.add(extra_constraints(path))
+            solver.add_assertion(extra_constraints(path))
 
         phi = phi_fn(path)
-        solver.add(Not(phi))
+        solver.add_assertion(Not(phi))
 
-        result = solver.check()
-        if result == unsat:
+        try:
+            result = solver.solve()
+        except SolverReturnedUnknownResultError:
+            result = None
+        if result is False:
             print(f"  HOLDS  :: {name}  (bound={bound})")
-        elif result == sat:
-            m = solver.model()
+        elif result is True:
+            m = solver.get_model()
             print(f"  FAILS  :: {name}  -- counterexample:")
             self._print_trace(m, path)
         else:
@@ -261,17 +305,19 @@ class GenericTransitionSystem:
     def check_reachable(self, name: str, target_fn: Callable, bound: int = 25,
                         timeout_ms: int = 30000):
         path = self.make_path(bound)
-        solver = Solver()
-        solver.set("timeout", timeout_ms)
-        solver.add(self.path_constraints(path))
-        solver.add(target_fn(path))
+        solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
+        solver.add_assertions(self.path_constraints(path))
+        solver.add_assertion(target_fn(path))
 
-        result = solver.check()
-        if result == sat:
-            m = solver.model()
+        try:
+            result = solver.solve()
+        except SolverReturnedUnknownResultError:
+            result = None
+        if result is True:
+            m = solver.get_model()
             print(f"  REACHABLE :: {name}")
             self._print_trace(m, path)
-        elif result == unsat:
+        elif result is False:
             print(f"  UNREACHABLE :: {name}  (bound={bound})")
         else:
             print(f"  ?????  :: {name}  -- timeout")
@@ -314,11 +360,12 @@ class GenericTransitionSystem:
             print(row)
 
     def _eval_one(self, model, var) -> float | str:
-        v = model.evaluate(var, model_completion=True)
+        v = model.get_value(var)
         try:
-            if hasattr(v, "as_decimal"):
-                return float(v.as_decimal(4).rstrip("?"))
-            return float(str(v))
+            value = v.constant_value()
+            if isinstance(value, Fraction):
+                return float(value)
+            return float(value)
         except (ValueError, ArithmeticError):
             return str(v)
 
@@ -391,7 +438,7 @@ class GenericTransitionSystem:
 
     def summary(self):
         print("=" * 70)
-        print("Generic Z3 Transition System")
+        print("Generic PySMT Transition System")
         print("=" * 70)
         print(f"  State variables   : {len(self.var_names)}")
         print(f"  Constants         : {len(self.constants)}")
@@ -424,4 +471,3 @@ class GenericTransitionSystem:
             print(f"    {short:<35} {vp.min_val:>10.3f} {vp.max_val:>10.3f} "
                   f"{vp.min_delta:>10.4f} {vp.max_delta:>10.4f} {float(init_disp):>10.3f}")
         print()
-
