@@ -27,4 +27,29 @@ if __name__ == "__main__":
     print(f"Loading: {json_path}")
     ts = from_json(json_path)
     # run_standard_checks(ts, bound=bound)
-    ts.to_smtlib("output.smt2")
+    ts.to_smtlib("output.smt2", bound = 1)
+
+# CVC
+# s = x_0, x_1 ,....
+# And(x_0 > 0, x_1 > 0...) - enough
+# \forall i, x_[i] > 0
+# Array (for comparison purpose)
+# z3 : sort - type of types.
+
+# one step transition (over approximation)
+# 0 1 0 2
+# 1 2 3 4
+# 0 2 (counterexample)
+
+# T = (x = 0 and x' = 1) or (x = 1 and x' = 2)
+# using timestamps.
+# T = (t = 1 and x = 0 and x' = 1 and t' = 1) or (t = 1 and x = 1 and x' = 2 and t' = 2)
+# does it speed up verification ? 
+# x' - x > 10
+# \exists i, t = i and t' = i + 1 -> cannot check for path. 
+# comparison.
+# look for encoding variations.
+
+# documentation - high level (todo/ slides)
+# workflow (diagram/walkthrough)
+# toolchains (PySMT, z3 briefly)

@@ -3,6 +3,7 @@ from typing import Any, Callable, Sequence
 
 from pysmt.exceptions import SolverReturnedUnknownResultError
 from pysmt.fnode import FNode
+from pysmt.smtlib.printers import to_smtlib
 from pysmt.shortcuts import (
     And,
     Bool,
@@ -504,7 +505,7 @@ class GenericTransitionSystem:
                     decls.add(f"(declare-fun {var} () Real)")
 
         constraints = self.path_constraints(trace)
-        constraints_str = "\n  ".join(c.serialize() for c in constraints)
+        constraints_str = "\n  ".join(to_smtlib(c, daggify=False) for c in constraints)
 
         # set languauge as quantifier-free linear real arithmetic and assert all constraints. and check for sat.
         with open(path, "w") as f:
