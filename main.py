@@ -24,10 +24,12 @@ if __name__ == "__main__":
         idx = sys.argv.index("--bound")
         bound = int(sys.argv[idx + 1])
 
+    concrete = "--concrete" in sys.argv
+
     print(f"Loading: {json_path}")
     ts = from_json(json_path)
     # run_standard_checks(ts, bound=bound)
-    ts.to_smtlib("output.smt2", bound = 1)
+    ts.to_smtlib("output.smt2", bound=bound, concrete=concrete)
 
 # CVC
 # s = x_0, x_1 ,....

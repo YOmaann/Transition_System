@@ -23,7 +23,7 @@ from pysmt.shortcuts import (
 from pysmt.typing import REAL
 
 from profiles import VarProfile, TraceProfile
-from utils.helper import _safe
+from utils.helper import _safe, _is_nan
 
 
 StateFn = Callable[[dict], FNode]
@@ -37,11 +37,13 @@ class GenericTransitionSystem:
 
     def __init__(self, profile: TraceProfile, skip_constant: bool = True,
                  exact_initial: bool = False, use_invariants: bool = True,
-                 model_time: bool = False):
+                 model_time: bool = False,
+                 trace: list[dict] | None = None):
         self.profile = profile # trace profile containing variable profiles.
         self.exact_initial = exact_initial # whether to enforce exact initial values.
         self.use_invariants = use_invariants # add invariant constraints based on variable ranges (constants and booleans are always invariant).
         self.model_time = model_time # is time needs to be modeled in a variable.
+        self.trace = trace # the concrete flat trace, kept so a run can be pinned exactly (see concrete_constraints).
 
         # you can skip constants if you want.
         if skip_constant:
@@ -196,6 +198,34 @@ class GenericTransitionSystem:
             c.extend(self.transition_constraints(path[i], path[i + 1]))
         return c
 
+
+    def concrete_constraints(self, path: list[dict], trace: list[dict] | None = None) -> list:
+        trace = trace if trace is not None else self.trace
+        if trace is None:
+            raise ValueError(
+                "concrete_constraints needs the flat trace; pass trace=... "
+                "or build the system via from_json (which stores it)."
+            )
+        constraints = []
+        steps = min(len(path), len(trace))
+        for i in range(steps):
+            state, row = path[i], trace[i]
+            for name in self.var_names:
+                if name not in row:
+                    continue
+                vp = self.profile.variables[name]
+                val = row[name]
+                if vp.is_list:
+                    if isinstance(val, tuple):
+                        for x, v in zip(state[name], val):
+                            if not _is_nan(v):
+                                constraints.append(Equals(x, _real(float(v))))
+                elif not _is_nan(val) and not isinstance(val, str):
+                    constraints.append(Equals(state[name], _real(float(val))))
+            if self.model_time and "timestamp" in row:
+                constraints.append(Equals(state["_t"], _real(row["timestamp"])))
+        return constraints
+
     # create propositions based on variable profiles. 
     def _build_propositions(self):
         for name, vp in self.profile.variables.items():
@@ -293,10 +323,13 @@ class GenericTransitionSystem:
         return Or(*clauses)
 
     def check(self, name: str, phi_fn: Callable, bound: int = 25,
-              extra_constraints: Callable | None = None, timeout_ms: int = 30000):
+              extra_constraints: Callable | None = None, timeout_ms: int = 30000,
+              concrete: bool = False):
         path = self.make_path(bound)
         solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
         solver.add_assertions(self.path_constraints(path))
+        if concrete:
+            solver.add_assertions(self.concrete_constraints(path))
         if extra_constraints:
             solver.add_assertion(extra_constraints(path))
 
@@ -319,10 +352,12 @@ class GenericTransitionSystem:
         return result
 
     def check_reachable(self, name: str, target_fn: Callable, bound: int = 25,
-                        timeout_ms: int = 30000):
+                        timeout_ms: int = 30000, concrete: bool = False):
         path = self.make_path(bound)
         solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
         solver.add_assertions(self.path_constraints(path))
+        if concrete:
+            solver.add_assertions(self.concrete_constraints(path))
         solver.add_assertion(target_fn(path))
 
         try:
@@ -489,7 +524,9 @@ class GenericTransitionSystem:
         print()
 
     # get output in SMT-LIB format for use with other tools.
-    def to_smtlib(self, path: str, bound: int = 25):
+    # concrete=True also pins every variable to its logged value, so the
+    # exported problem describes exactly the recorded run.
+    def to_smtlib(self, path: str, bound: int = 25, concrete: bool = False):
         trace = self.make_path(bound)
 
         decls = set() # declarations for all variables in the path
@@ -505,6 +542,8 @@ class GenericTransitionSystem:
                     decls.add(f"(declare-fun {var} () Real)")
 
         constraints = self.path_constraints(trace)
+        if concrete:
+            constraints = constraints + self.concrete_constraints(trace)
         constraints_str = "\n  ".join(to_smtlib(c, daggify=False) for c in constraints)
 
         # set languauge as quantifier-free linear real arithmetic and assert all constraints. and check for sat.
