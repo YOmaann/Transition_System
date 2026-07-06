@@ -20,7 +20,7 @@ from pysmt.shortcuts import (
     Solver,
     Symbol,
 )
-from pysmt.typing import REAL
+from pysmt.typing import REAL, ArrayType
 
 from profiles import VarProfile, TraceProfile
 from utils.helper import _safe, _is_nan
@@ -69,8 +69,15 @@ class GenericTransitionSystem:
                 state[name] = tuple(
                     Symbol(f"{base}_{i}_{t}", REAL) for i in range(vp.list_len)
                 )
+                # now creating variables in a list
+                # type_ = REAL if not vp.is_boolean else REAL
+                # profiles.variables[name].values = ArrayType(REAL, type_)
+                # for i in range(vp.list_len):
+                #     profiles.variables[name].values = profiles.variables[name].values.Store(Symbol(f"{base}_{i}", REAL))
             else:
                 state[name] = Symbol(f"{base}_{t}", REAL)
+                # now creating variables in a list
+                # profile.variables[name].values = profile.variables[name].values.Store(Symbol(f"{base}", REAL))
         for name, val in self.constants.items():
             state[name] = _real(val)
         if self.model_time:
@@ -478,6 +485,9 @@ class GenericTransitionSystem:
                     break
         return result
 
+    # shortens the name
+    # removes [0] and keeps only the last two parts of the name.
+    # stream_a.foo.bar[0].baz to stream_a.bar.baz
     @staticmethod
     def _short_name(name: str) -> str:
         parts = name.replace("[0]", "").split(".")
@@ -543,7 +553,8 @@ class GenericTransitionSystem:
 
         constraints = self.path_constraints(trace)
         if concrete:
-            constraints = constraints + self.concrete_constraints(trace)
+            # constraints = constraints + self.concrete_constraints(trace)
+            constraints = self.concrete_constraints(trace)
         constraints_str = "\n  ".join(to_smtlib(c, daggify=False) for c in constraints)
 
         # set languauge as quantifier-free linear real arithmetic and assert all constraints. and check for sat.

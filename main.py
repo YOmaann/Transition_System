@@ -1,35 +1,106 @@
 from __future__ import annotations
 
-import json
-import math
-import statistics
-import sys
-from dataclasses import dataclass, field
-from enum import Enum
-from itertools import product
-from typing import Any, Callable, Literal, Sequence
-from trace import TraceOptions, build_trace
-from profiles import VarProfile, TraceProfile
-from utils.helper import _is_nan, _safe
-from generic_ts import GenericTransitionSystem
+import argparse
+from fractions import Fraction
+
+from trace import ArrayMode, TraceOptions
 from pipeline import from_json, run_standard_checks
+from pysmt.shortcuts import LE, Real
+
+
+def _real(value: float | int):
+    return Real(Fraction(str(value)))
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=(
+            "Convert a generic JSON trace into a transition system, run checks, "
+            "and export the symbolic path to SMT-LIB."
+        ),
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default="./example/test.json",
+        help="Path to the input JSON trace file (default: ./example/test.json).",
+    )
+    parser.add_argument(
+        "-b", "--bound",
+        type=int,
+        default=25,
+        help="Bound on the length of traces to check (default: 25).",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="output.smt2",
+        help="Path to write the SMT-LIB output (default: output.smt2).",
+    )
+    parser.add_argument(
+        "--no-concrete",
+        dest="concrete",
+        action="store_false",
+        help="Emit symbolic (over-approximated) constraints instead of binding "
+             "concrete observed values to states.",
+    )
+    parser.add_argument(
+        "--array-mode",
+        choices=[mode.value for mode in ArrayMode],
+        default=ArrayMode.TRUNCATE.value,
+        help="How to flatten arrays in the trace (default: truncate).",
+    )
+    parser.add_argument(
+        "--max-list-items",
+        type=int,
+        default=2,
+        help="Max number of items to keep when flattening lists (default: 2).",
+    )
+    parser.add_argument(
+        "--margin",
+        type=float,
+        default=0.15,
+        help="Fractional margin added to observed variable ranges (default: 0.15).",
+    )
+    parser.add_argument(
+        "--standard-checks",
+        action="store_true",
+        help="Run the built-in standard checks (safety, monotonicity, liveness, "
+             "reachability) instead of the example speed check.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    opts = TraceOptions(
+        array_mode=ArrayMode(args.array_mode),
+        max_list_items=args.max_list_items,
+    )
+
+    print(f"Loading: {args.path}")
+    ts = from_json(args.path, opts=opts, margin_pct=args.margin)
+
+    if args.standard_checks:
+        run_standard_checks(ts, bound=args.bound)
+    else:
+        speed_var = "ego_vehicle_kinematicks.ego_vehicle_kinematicks.x"
+        limit = 100.0
+        ts.check(
+            f"G({ts._short_name(speed_var)} <= {limit})",
+            lambda p, n=speed_var, hi=limit: ts.ltl_G(
+                p, lambda s, n=n, hi=hi: LE(s[n], _real(hi))
+            ),
+            args.bound,
+        )
+
+    ts.to_smtlib(args.output, bound=args.bound, concrete=args.concrete)
+    print(f"done: wrote {args.output}")
+
 
 if __name__ == "__main__":
-    json_path = sys.argv[1] if len(sys.argv) > 1 else "./example/swerve/swerve_sim1.json"
-    bound = int(sys.argv[2]) if len(sys.argv) > 2 else 25
-
-
-    # bound on the length of traces to check
-    if "--bound" in sys.argv:
-        idx = sys.argv.index("--bound")
-        bound = int(sys.argv[idx + 1])
-
-    concrete = "--concrete" in sys.argv
-
-    print(f"Loading: {json_path}")
-    ts = from_json(json_path)
-    # run_standard_checks(ts, bound=bound)
-    ts.to_smtlib("output.smt2", bound=bound, concrete=concrete)
+    main()
 
 # CVC
 # s = x_0, x_1 ,....
@@ -55,3 +126,6 @@ if __name__ == "__main__":
 # documentation - high level (todo/ slides)
 # workflow (diagram/walkthrough)
 # toolchains (PySMT, z3 briefly)
+
+# concrete examples
+# precision of the perceived bus (predicted path)

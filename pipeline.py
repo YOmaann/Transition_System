@@ -30,9 +30,10 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
     ts.summary()
 
     print("=" * 70)
-    print("SAFETY -- invariant bounds hold for all variables")
+    print("SAFETY: invariant bounds hold for all variables")
     print("=" * 70)
 
+    # for each variable, check that it is always within its observed min/max range.
     for name in ts._pick_display_vars(5):
         vp = ts.profile.variables[name]
         if vp.is_list:
@@ -47,7 +48,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
         )
 
     print("=" * 70)
-    print("MONOTONICITY -- variables that only increase/decrease in data")
+    print("MONOTONICITY: variables that only increase/decrease in data")
     print("=" * 70)
     for name in ts.var_names:
         vp = ts.profile.variables[name]
@@ -56,7 +57,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
         short = ts._short_name(name)
         if vp.is_monotone_inc:
             ts.check(
-                f"G({short}[t+1] >= {short}[t]) -- monotone increasing",
+                f"G({short}[t+1] >= {short}[t]): monotone increasing",
                 lambda p, n=name: And(*[
                     GE(p[i + 1][n], p[i][n]) for i in range(len(p) - 1)
                 ]),
@@ -64,7 +65,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             )
         if vp.is_monotone_dec:
             ts.check(
-                f"G({short}[t+1] <= {short}[t]) -- monotone decreasing",
+                f"G({short}[t+1] <= {short}[t]): monotone decreasing",
                 lambda p, n=name: And(*[
                     LE(p[i + 1][n], p[i][n]) for i in range(len(p) - 1)
                 ]),
@@ -72,7 +73,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             )
 
     print("=" * 70)
-    print("LIVENESS -- boolean variables eventually become true")
+    print("LIVENESS: boolean variables eventually become true")
     print("=" * 70)
     for name in ts.var_names:
         vp = ts.profile.variables[name]
@@ -87,7 +88,7 @@ def run_standard_checks(ts: GenericTransitionSystem, bound: int = 25):
             )
 
     print("=" * 70)
-    print("REACHABILITY -- can extreme observed values be reached?")
+    print("REACHABILITY: can extreme observed values be reached?")
     print("=" * 70)
     for name in ts._pick_display_vars(5):
         vp = ts.profile.variables[name]

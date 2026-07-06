@@ -27,6 +27,8 @@ class VarProfile:
     is_list: bool = False
     list_len: int = 0
     presence_count: int = 0
+    # a list which hold multiple values for a variable across the trace. This is useful for list type variables.
+    # values: list[Any] = field(default_factory=list)
 
 
 # profile of an entire trace
