@@ -8,19 +8,23 @@ from pysmt.shortcuts import (
     And,
     Bool,
     Equals,
+    Exists,
+    ForAll,
     GE,
     GT,
     Implies,
+    Int,
     LE,
     LT,
     Minus,
     Not,
     Or,
     Real,
+    Select,
     Solver,
     Symbol,
 )
-from pysmt.typing import REAL, ArrayType
+from pysmt.typing import INT, REAL, ArrayType
 
 from profiles import VarProfile, TraceProfile
 from utils.helper import _safe, _is_nan
@@ -65,24 +69,54 @@ class GenericTransitionSystem:
         for name in self.var_names:
             vp = self.profile.variables[name]
             base = _safe(name)
+
             if vp.is_list:
-                state[name] = tuple(
-                    Symbol(f"{base}_{i}_{t}", REAL) for i in range(vp.list_len)
-                )
+                # state[name] = tuple(
+                #     Symbol(f"{base}_{i}_{t}", REAL) for i in range(vp.list_len)
+                # )
                 # now creating variables in a list
-                # type_ = REAL if not vp.is_boolean else REAL
-                # profiles.variables[name].values = ArrayType(REAL, type_)
-                # for i in range(vp.list_len):
-                #     profiles.variables[name].values = profiles.variables[name].values.Store(Symbol(f"{base}_{i}", REAL))
+                state[name] = Symbol(f"{base}_{t}", ArrayType(INT, REAL))
             else:
-                state[name] = Symbol(f"{base}_{t}", REAL)
+                # state[name] = Symbol(f"{base}_{t}", REAL)
                 # now creating variables in a list
-                # profile.variables[name].values = profile.variables[name].values.Store(Symbol(f"{base}", REAL))
+                state[name] = Symbol(f"{base}_{t}", REAL)
+                # self.profile.variables[name].values = self.profile.variables[name].values.Store(Symbol(f"{base}", REAL))
         for name, val in self.constants.items():
             state[name] = _real(val)
         if self.model_time:
             state["_t"] = Symbol(f"_t_{t}", REAL)
         return state
+
+    # returns a list of FNode elements for a list variable in state s.
+    def _elems(self, s: dict, name: str) -> list[FNode]:
+        vp = self.profile.variables[name]
+        arr = s[name]
+        return [Select(arr, Int(i)) for i in range(vp.list_len)]
+
+    # map an index label to a symbolic integert variable. 
+    def index(self, label: str = "i") -> FNode:
+        return Symbol(f"_idx_{label}", INT)
+
+    # bound the value of i based on rthe length ogf the list.
+    def in_range(self, name: str, i: FNode) -> FNode:
+        vp = self.profile.variables[name]
+        return And(GE(i, Int(0)), LT(i, Int(vp.list_len)))
+
+    # element access a[i] for a (possibly symbolic) index i.
+    def at(self, s: dict, name: str, i: FNode) -> FNode:
+        return Select(s[name], i)
+
+    # yields: forall i.. . (each i in range of its list) -> body.
+    def forall_idx(self, bindings: Sequence[tuple[str, FNode]], body: FNode) -> FNode:
+        idxs = [i for _, i in bindings]
+        guard = And(*[self.in_range(name, i) for name, i in bindings])
+        return ForAll(idxs, Implies(guard, body))
+
+    # generic existential query over one or more indices.
+    def exists_idx(self, bindings: Sequence[tuple[str, FNode]], body: FNode) -> FNode:
+        idxs = [i for _, i in bindings]
+        guard = And(*[self.in_range(name, i) for name, i in bindings])
+        return Exists(idxs, And(guard, body))
 
     # make states and add concrete (python) timestamp for each state in the path.
     def symbolic_states_at(self, timestamps: Sequence[float]) -> list[dict[str, Any]]:
@@ -110,7 +144,7 @@ class GenericTransitionSystem:
             vp = self.profile.variables[name]
             if vp.is_list:
                 init = vp.initial if isinstance(vp.initial, tuple) else (float(vp.initial),) * vp.list_len
-                for i, x in enumerate(s0[name]):
+                for i, x in enumerate(self._elems(s0, name)):
                     if self.exact_initial:
                         constraints.append(Equals(x, _real(init[i])))
                     else:
@@ -142,7 +176,7 @@ class GenericTransitionSystem:
         constraints = []
         for name in self.var_names:
             vp = self.profile.variables[name]
-            xs = s[name] if vp.is_list else (s[name],)
+            xs = self._elems(s, name) if vp.is_list else (s[name],)
             for x in xs:
                 if vp.is_boolean:
                     constraints.append(
@@ -224,7 +258,7 @@ class GenericTransitionSystem:
                 val = row[name]
                 if vp.is_list:
                     if isinstance(val, tuple):
-                        for x, v in zip(state[name], val):
+                        for x, v in zip(self._elems(state, name), val):
                             if not _is_nan(v):
                                 constraints.append(Equals(x, _real(float(v))))
                 elif not _is_nan(val) and not isinstance(val, str):
@@ -242,24 +276,24 @@ class GenericTransitionSystem:
             if vp.is_list:
                 if vp.is_boolean:
                     self.propositions[f"{base}_any_true"] = (
-                        lambda s, n=name: Or(*[GE(x, _real(0.5)) for x in s[n]])) # if any element in the list is true (>= 0.5), then the proposition holds.
+                        lambda s, n=name: Or(*[GE(x, _real(0.5)) for x in self._elems(s, n)])) # if any element in the list is true (>= 0.5), then the proposition holds.
                     self.propositions[f"{base}_all_true"] = (
-                        lambda s, n=name: And(*[GE(x, _real(0.5)) for x in s[n]]))
+                        lambda s, n=name: And(*[GE(x, _real(0.5)) for x in self._elems(s, n)]))
                 else:
                     self.propositions[f"{base}_any_high"] = (
                         lambda s, n=name, th=vp.q75: Or(
-                            *[GT(x, _real(th)) for x in s[n]]
+                            *[GT(x, _real(th)) for x in self._elems(s, n)]
                         ))
                     self.propositions[f"{base}_all_low"] = (
                         lambda s, n=name, th=vp.q25: And(
-                            *[LT(x, _real(th)) for x in s[n]]
+                            *[LT(x, _real(th)) for x in self._elems(s, n)]
                         ))
                     if vp.min_val <= 0 <= vp.max_val:
                         eps = max((vp.max_val - vp.min_val) * 0.05, 0.01)
                         self.propositions[f"{base}_any_near_zero"] = (
                             lambda s, n=name, e=eps: Or(*[
                                 And(GE(x, _real(-e)), LE(x, _real(e)))
-                                for x in s[n]
+                                for x in self._elems(s, n)
                             ]))
             elif vp.is_boolean:
                 self.propositions[f"{base}_true"] = lambda s, n=name: GE(s[n], _real(0.5))
@@ -288,13 +322,13 @@ class GenericTransitionSystem:
     def add_proposition(self, name: str, fn: StateFn):
         self.propositions[name] = fn
 
-    @staticmethod
-    def exists_element(s: dict, name: str, pred: Callable[[Any], Any]):
-        return Or(*[pred(x) for x in s[name]])
+    # bounded (finite unrolling) counterparts of exists_idx/forall_idx: no quantifier,
+    # pred takes only the element. Use these when you don't need the index itself.
+    def exists_element(self, s: dict, name: str, pred: Callable[[Any], Any]):
+        return Or(*[pred(x) for x in self._elems(s, name)])
 
-    @staticmethod
-    def forall_element(s: dict, name: str, pred: Callable[[Any], Any]):
-        return And(*[pred(x) for x in s[name]])
+    def forall_element(self, s: dict, name: str, pred: Callable[[Any], Any]):
+        return And(*[pred(x) for x in self._elems(s, name)])
 
     @staticmethod
     def ltl_G(path: list[dict], prop_fn: StateFn):
@@ -432,6 +466,15 @@ class GenericTransitionSystem:
         for key, var in s.items():
             if key == "_t_concrete":
                 vals[key] = var
+                continue
+            vp = self.profile.variables.get(key)
+            # list vars are SMT arrays: read each element back as a tuple of floats
+            # so _print_trace / _get_active_props keep working unchanged.
+            if vp is not None and vp.is_list:
+                vals[key] = tuple(
+                    self._eval_one(model, Select(var, Int(i)))
+                    for i in range(vp.list_len)
+                )
             elif isinstance(var, tuple):
                 vals[key] = tuple(self._eval_one(model, x) for x in var)
             else:
@@ -542,13 +585,13 @@ class GenericTransitionSystem:
         decls = set() # declarations for all variables in the path
         for s in trace:
             for var in s.values():
-                # skip floats
-                if isinstance(var, float):
+                # skip constants (Real literals) and the concrete timestamp float
+                if not (isinstance(var, FNode) and var.is_symbol()):
                     continue
-                if isinstance(var, tuple):
-                    for x in var:
-                        decls.add(f"(declare-fun {x} () Real)")
-                elif isinstance(var, FNode) and var.is_symbol():
+                # list vars are SMT arrays (Array Int Real); scalars/time are Real
+                if var.symbol_type().is_array_type():
+                    decls.add(f"(declare-fun {var} () (Array Int Real))")
+                else:
                     decls.add(f"(declare-fun {var} () Real)")
 
         constraints = self.path_constraints(trace)
@@ -557,6 +600,7 @@ class GenericTransitionSystem:
             constraints = self.concrete_constraints(trace)
         constraints_str = "\n  ".join(to_smtlib(c, daggify=False) for c in constraints)
 
-        # set languauge as quantifier-free linear real arithmetic and assert all constraints. and check for sat.
+        # arrays (and any exists_idx/forall_idx quantifiers) need array + int/real theories;
+        # ALL keeps the export solver-agnostic across Z3/cvc5 instead of a narrow QF_ logic.
         with open(path, "w") as f:
-            f.write( f"(set-logic QF_LRA)\n{chr(10).join(decls)}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n")
+            f.write( f"(set-logic ALL)\n{chr(10).join(decls)}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n")

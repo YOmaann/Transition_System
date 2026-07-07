@@ -27,8 +27,7 @@ class VarProfile:
     is_list: bool = False
     list_len: int = 0
     presence_count: int = 0
-    # a list which hold multiple values for a variable across the trace. This is useful for list type variables.
-    # values: list[Any] = field(default_factory=list)
+    values: tuple = field(default_factory=tuple)
 
 
 # profile of an entire trace
@@ -166,6 +165,11 @@ def profile_trace(trace: list[dict[str, Any]], margin_pct: float = 0.15) -> Trac
                 vp.is_monotone_inc = all(d >= 0 for d in deltas)
                 vp.is_monotone_dec = all(d <= 0 for d in deltas)
 
-        prof.variables[name] = vp
+        # storew the concrete values.
+        vp.values = tuple(
+            x for v in per_state if v is not None for x in per_element(v)
+        )
+
+        prof.variables[name] = vp  
 
     return prof

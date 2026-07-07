@@ -1,0 +1,66 @@
+{
+  "ego_vehicle_kinematicks": [
+    {
+      "timestamp": 1,
+      "ego_vehicle_kinematicks": {
+        "x": 0.0,
+        "y": 0.0
+      }
+    },
+    {
+      "timestamp": 2,
+      "ego_vehicle_kinematicks": {
+        "x": 1.0,
+        "y": 0.0
+      }
+    },
+    {
+      "timestamp": 3,
+      "ego_vehicle_kinematicks": {
+        "x": 2.0,
+        "y": 0.0
+      }
+    }
+  ],
+  "npc_vehicle_kinematicks": [
+    {
+      "timestamp": 1.1,
+      "npc_vehicle_kinematicks": {
+        "x": 10.0,
+        "y": 0.0
+      }
+    },
+    {
+      "timestamp": 2.5,
+      "npc_vehicle_kinematicks": {
+        "x": 9.0,
+        "y": 0.0
+      }
+    },
+    {
+      "timestamp": 3,
+      "npc_vehicle_kinematicks": {
+        "x": 8.0,
+        "y": 0.0
+      }
+    }
+  ],
+  "traffic_light_state": [
+    {
+      "timestamp": 1,
+      "traffic_light_state": "green",
+      "position": {
+        "x": 5.0,
+        "y": 1.0
+      }
+    },
+    {
+      "timestamp": 3,
+      "traffic_light_state": "yellow",
+      "position": {
+        "x": 5.0,
+        "y": 0.0
+      }
+    }
+  ]
+}
