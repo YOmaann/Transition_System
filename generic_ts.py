@@ -23,6 +23,7 @@ from pysmt.shortcuts import (
     Select,
     Solver,
     Symbol,
+    substitute,
 )
 from pysmt.typing import INT, REAL, ArrayType
 
@@ -322,8 +323,6 @@ class GenericTransitionSystem:
     def add_proposition(self, name: str, fn: StateFn):
         self.propositions[name] = fn
 
-    # bounded (finite unrolling) counterparts of exists_idx/forall_idx: no quantifier,
-    # pred takes only the element. Use these when you don't need the index itself.
     def exists_element(self, s: dict, name: str, pred: Callable[[Any], Any]):
         return Or(*[pred(x) for x in self._elems(s, name)])
 
@@ -468,8 +467,6 @@ class GenericTransitionSystem:
                 vals[key] = var
                 continue
             vp = self.profile.variables.get(key)
-            # list vars are SMT arrays: read each element back as a tuple of floats
-            # so _print_trace / _get_active_props keep working unchanged.
             if vp is not None and vp.is_list:
                 vals[key] = tuple(
                     self._eval_one(model, Select(var, Int(i)))
@@ -582,25 +579,34 @@ class GenericTransitionSystem:
     def to_smtlib(self, path: str, bound: int = 25, concrete: bool = False):
         trace = self.make_path(bound)
 
-        decls = set() # declarations for all variables in the path
-        for s in trace:
-            for var in s.values():
-                # skip constants (Real literals) and the concrete timestamp float
-                if not (isinstance(var, FNode) and var.is_symbol()):
-                    continue
-                # list vars are SMT arrays (Array Int Real); scalars/time are Real
-                if var.symbol_type().is_array_type():
-                    decls.add(f"(declare-fun {var} () (Array Int Real))")
-                else:
-                    decls.add(f"(declare-fun {var} () Real)")
-
         constraints = self.path_constraints(trace)
         if concrete:
-            # constraints = constraints + self.concrete_constraints(trace)
             constraints = self.concrete_constraints(trace)
-        constraints_str = "\n  ".join(to_smtlib(c, daggify=False) for c in constraints)
 
-        # arrays (and any exists_idx/forall_idx quantifiers) need array + int/real theories;
-        # ALL keeps the export solver-agnostic across Z3/cvc5 instead of a narrow QF_ logic.
+        aggregates: dict[str, FNode] = {}
+        subs: dict[FNode, FNode] = {}
+        for t, state in enumerate(trace):
+            for name, var in state.items():
+                if not (isinstance(var, FNode) and var.is_symbol()):
+                    continue
+                agg = aggregates.get(name)
+                if agg is None:
+                    agg = Symbol(_safe(name), ArrayType(INT, var.symbol_type()))
+                    aggregates[name] = agg
+                subs[var] = Select(agg, Int(t))
+
+        def _sort(ty) -> str:
+            if ty.is_array_type():
+                return f"(Array {_sort(ty.index_type)} {_sort(ty.elem_type)})"
+            return "Int" if ty == INT else "Real"
+
+        decls = "\n".join(
+            f"(declare-fun {agg} () {_sort(agg.symbol_type())})"
+            for agg in aggregates.values()
+        )
+        constraints_str = "\n  ".join(
+            to_smtlib(substitute(c, subs), daggify=False) for c in constraints
+        )
+
         with open(path, "w") as f:
-            f.write( f"(set-logic ALL)\n{chr(10).join(decls)}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n")
+            f.write( f"(set-logic ALL)\n{decls}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n")
