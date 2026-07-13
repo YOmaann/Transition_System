@@ -40,7 +40,7 @@ def _real(value: float | int) -> FNode:
 # Generic transition system built from a trace profile.
 class GenericTransitionSystem:
 
-    def __init__(self, profile: TraceProfile, skip_constant: bool = True,
+    def __init__(self, profile: TraceProfile, skip_constant: bool = False,
                  exact_initial: bool = False, use_invariants: bool = True,
                  model_time: bool = False,
                  trace: list[dict] | None = None):
@@ -82,10 +82,13 @@ class GenericTransitionSystem:
                 # now creating variables in a list
                 state[name] = Symbol(f"{base}_{t}", REAL)
                 # self.profile.variables[name].values = self.profile.variables[name].values.Store(Symbol(f"{base}", REAL))
-        for name, val in self.constants.items():
-            state[name] = _real(val)
+        # constants are kept symbolic (as arrays after aggregation) so they get
+        # declared and bound in the SMT-LIB output instead of folding into literals.
+        for name in self.constants:
+            if name not in state:
+                state[name] = Symbol(f"{_safe(name)}_{t}", REAL)
         if self.model_time:
-            state["_t"] = Symbol(f"_t_{t}", REAL)
+            state["timestamp"] = Symbol(f"timestamp_{t}", REAL)
         return state
 
     # returns a list of FNode elements for a list variable in state s.
@@ -133,7 +136,7 @@ class GenericTransitionSystem:
         if not self.model_time:
             raise ValueError("pin_time requires model_time=True")
         return [
-            Equals(path[i]["_t"], _real(timestamps[i]))
+            Equals(path[i]["timestamp"], _real(timestamps[i]))
             for i in range(len(timestamps))
         ]
 
@@ -165,11 +168,11 @@ class GenericTransitionSystem:
         if self.model_time:
             ti = self.profile.time_initial
             if self.exact_initial:
-                constraints.append(Equals(s0["_t"], _real(ti)))
+                constraints.append(Equals(s0["timestamp"], _real(ti)))
             else:
                 tm = self._time_margin()
-                constraints.append(GE(s0["_t"], _real(ti - tm)))
-                constraints.append(LE(s0["_t"], _real(ti + tm)))
+                constraints.append(GE(s0["timestamp"], _real(ti - tm)))
+                constraints.append(LE(s0["timestamp"], _real(ti + tm)))
         return constraints
 
     # add invariant constraints if provided.
@@ -177,6 +180,8 @@ class GenericTransitionSystem:
         constraints = []
         for name in self.var_names:
             vp = self.profile.variables[name]
+            if vp.is_constant and not vp.is_list:
+                continue  # pinned exactly below
             xs = self._elems(s, name) if vp.is_list else (s[name],)
             for x in xs:
                 if vp.is_boolean:
@@ -189,8 +194,13 @@ class GenericTransitionSystem:
                     constraints.append(LE(x, _real(vp.max_val + margin)))
         if self.model_time and self.use_invariants:
             tm = self._time_margin()
-            constraints.append(GE(s["_t"], _real(self.profile.time_min - tm)))
-            constraints.append(LE(s["_t"], _real(self.profile.time_max + tm)))
+            constraints.append(GE(s["timestamp"], _real(self.profile.time_min - tm)))
+            constraints.append(LE(s["timestamp"], _real(self.profile.time_max + tm)))
+        # pin every scalar constant to its value at each state so it shows up as a
+        # bound array element (= (select c t) v) rather than a folded literal.
+        for name, val in self.constants.items():
+            if name in s:
+                constraints.append(Equals(s[name], _real(val)))
         for inv_fn in self._custom_invariants:
             constraints.append(inv_fn(s))
         return constraints
@@ -211,7 +221,7 @@ class GenericTransitionSystem:
             if vp.is_monotone_dec:
                 constraints.append(LE(delta, _real(0))) # decreasing value constraint
         if self.model_time:
-            dt = Minus(s_next["_t"], s_curr["_t"])
+            dt = Minus(s_next["timestamp"], s_curr["timestamp"])
             constraints.append(GE(dt, _real(0))) # time must advance
             tm = self._time_margin()
             dmin = max(self.profile.time_min_delta - tm, 0.0)
@@ -265,7 +275,7 @@ class GenericTransitionSystem:
                 elif not _is_nan(val) and not isinstance(val, str):
                     constraints.append(Equals(state[name], _real(float(val))))
             if self.model_time and "timestamp" in row:
-                constraints.append(Equals(state["_t"], _real(row["timestamp"])))
+                constraints.append(Equals(state["timestamp"], _real(row["timestamp"])))
         return constraints
 
     # create propositions based on variable profiles. 

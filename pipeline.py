@@ -21,7 +21,7 @@ def from_json(path: str, opts: TraceOptions | None = None,
         data = json.load(f)
     trace = build_trace(data, opts)
     profile = profile_trace(trace, margin_pct=margin_pct)
-    return GenericTransitionSystem(profile, trace=trace)
+    return GenericTransitionSystem(profile, trace=trace, model_time=True)
 
 
 
