@@ -1,4 +1,6 @@
 from fractions import Fraction
+from functools import lru_cache
+import re
 from typing import Any, Callable, Sequence
 
 from pysmt.exceptions import SolverReturnedUnknownResultError
@@ -33,9 +35,23 @@ from utils.helper import _safe, _is_nan
 
 StateFn = Callable[[dict], FNode]
 
+list_index_pattern = re.compile(r"\[(\d+)\]")
 
+
+@lru_cache(maxsize=None)
 def _real(value: float | int) -> FNode:
     return Real(Fraction(str(value)))
+
+
+@lru_cache(maxsize=None)
+def _real_str(value: float | int) -> str:
+    return to_smtlib(_real(value), daggify=False)
+
+
+def _smt_sort(ty) -> str:
+    if ty.is_array_type():
+        return f"(Array {_smt_sort(ty.index_type)} {_smt_sort(ty.elem_type)})"
+    return "Int" if ty == INT else "Real"
 
 # Generic transition system built from a trace profile.
 class GenericTransitionSystem:
@@ -62,6 +78,8 @@ class GenericTransitionSystem:
         }
         self.propositions: dict[str, StateFn] = {}
         self._custom_invariants: list[StateFn] = []
+        self.derivations: dict[str, Callable[[list, int], Any]] = {}
+        self.aggregate_cache: tuple | None = None
         self._build_propositions()
 
     # make state variables for a given timestamp t. vars are named {varname}_{t} for scalars and {varname}_{i}_{t} for lists}
@@ -102,18 +120,23 @@ class GenericTransitionSystem:
         return Symbol(f"_idx_{label}", INT)
 
     # bound the value of i based on rthe length ogf the list.
-    def in_range(self, name: str, i: FNode) -> FNode:
-        vp = self.profile.variables[name]
-        return And(GE(i, Int(0)), LT(i, Int(vp.list_len)))
+    def in_range(self, name: str, i: FNode, upper: int | None = None) -> FNode:
+        length = upper if upper is not None else self.profile.variables[name].list_len
+        return And(GE(i, Int(0)), LT(i, Int(length)))
 
     # element access a[i] for a (possibly symbolic) index i.
     def at(self, s: dict, name: str, i: FNode) -> FNode:
         return Select(s[name], i)
 
     # yields: forall i.. . (each i in range of its list) -> body.
-    def forall_idx(self, bindings: Sequence[tuple[str, FNode]], body: FNode) -> FNode:
-        idxs = [i for _, i in bindings]
-        guard = And(*[self.in_range(name, i) for name, i in bindings])
+    # each binding is (name, index) or (name, index, upper_bound).
+    def forall_idx(self, bindings: Sequence[tuple], body: FNode) -> FNode:
+        idxs = [binding[1] for binding in bindings]
+        guard = And(*[
+            self.in_range(binding[0], binding[1],
+                          binding[2] if len(binding) > 2 else None)
+            for binding in bindings
+        ])
         return ForAll(idxs, Implies(guard, body))
 
     # generic existential query over one or more indices.
@@ -121,6 +144,88 @@ class GenericTransitionSystem:
         idxs = [i for _, i in bindings]
         guard = And(*[self.in_range(name, i) for name, i in bindings])
         return Exists(idxs, And(guard, body))
+
+    # collapse the per-step, per-index symbols of a path into one nested-array
+    def build_arrays(self, path: list[dict]):
+        arrays: dict[str, FNode] = {}
+        substitutions: dict[FNode, FNode] = {}
+        dimension_sizes: dict[str, list[int]] = {}
+        element_length: dict[str, int] = {}
+        name_parts: dict[str, tuple[str, list[int]]] = {}
+
+        for step, state in enumerate(path):
+            for name, symbol in state.items():
+                if not (isinstance(symbol, FNode) and symbol.is_symbol()):
+                    continue
+
+                parts = name_parts.get(name)
+                if parts is None:
+                    indices = [int(i) for i in list_index_pattern.findall(name)]
+                    parts = (_safe(list_index_pattern.sub("", name)), indices)
+                    name_parts[name] = parts
+                array_name, indices = parts
+
+                array = arrays.get(array_name)
+                if array is None:
+                    element_type = symbol.symbol_type()
+                    for _ in indices:
+                        element_type = ArrayType(INT, element_type)
+                    array = Symbol(array_name, ArrayType(INT, element_type))
+                    arrays[array_name] = array
+                    dimension_sizes[array_name] = [0] * len(indices)
+                    vp = self.profile.variables.get(name)
+                    element_length[array_name] = vp.list_len if (vp and vp.is_list) else 0
+
+                sizes = dimension_sizes[array_name]
+                for position, index in enumerate(indices):
+                    if index > sizes[position]:
+                        sizes[position] = index
+
+                selection = Select(array, Int(step))
+                for index in indices:
+                    selection = Select(selection, Int(index))
+                substitutions[symbol] = selection
+
+        num_steps = len(path)
+        shapes: dict[str, tuple[int, ...]] = {}
+        for array_name in arrays:
+            dims = [num_steps] + [size + 1 for size in dimension_sizes[array_name]]
+            if element_length[array_name]:
+                dims.append(element_length[array_name])
+            shapes[array_name] = tuple(dims)
+        return arrays, substitutions, shapes
+
+    def _arrays(self, bound: int):
+        if self.aggregate_cache is None or self.aggregate_cache[0] != bound:
+            self.aggregate_cache = (bound, *self.build_arrays(self.make_path(bound)))
+        return self.aggregate_cache[1], self.aggregate_cache[2], self.aggregate_cache[3]
+
+    # per-dimension sizes of a nested-array variable, usable as forall bounds.
+    def array_shape(self, name: str, bound: int = 25) -> tuple[int, ...]:
+        return self._arrays(bound)[2][name]
+
+    # the nested-array symbol for a variable, e.g. to index it in a property.
+    def array(self, name: str, bound: int = 25) -> FNode:
+        return self._arrays(bound)[0][name]
+
+    def array_forall(self, name: str,
+                     make_body: Callable[[FNode, list[FNode]], FNode],
+                     bound: int = 25,
+                     labels: Sequence[str] | None = None) -> FNode:
+        arrays, _, shapes = self._arrays(bound)
+        shape = shapes[name]
+        array = arrays[name]
+        labels = labels or [f"d{dimension}" for dimension in range(len(shape))]
+        indices = [self.index(label) for label in labels]
+
+        element = array
+        for index in indices:
+            element = Select(element, index)
+        guard = And(*[
+            And(GE(index, Int(0)), LT(index, Int(size)))
+            for index, size in zip(indices, shape)
+        ])
+        return ForAll(indices, Implies(guard, make_body(element, indices)))
 
     # make states and add concrete (python) timestamp for each state in the path.
     def symbolic_states_at(self, timestamps: Sequence[float]) -> list[dict[str, Any]]:
@@ -207,6 +312,9 @@ class GenericTransitionSystem:
 
     def add_invariant(self, fn: StateFn):
         self._custom_invariants.append(fn)
+
+    def add_derivation(self, name: str, fn: Callable[[list, int], Any]):
+        self.derivations[_safe(name)] = fn
 
     # add transition constraints based on monotonicity and time deltas.
     def transition_constraints(self, s_curr: dict, s_next: dict) -> list:
@@ -587,36 +695,109 @@ class GenericTransitionSystem:
     # concrete=True also pins every variable to its logged value, so the
     # exported problem describes exactly the recorded run.
     def to_smtlib(self, path: str, bound: int = 25, concrete: bool = False):
-        trace = self.make_path(bound)
-
-        constraints = self.path_constraints(trace)
         if concrete:
-            constraints = self.concrete_constraints(trace)
+            self._write_concrete_smtlib(path, bound)
+            return
 
-        aggregates: dict[str, FNode] = {}
-        subs: dict[FNode, FNode] = {}
-        for t, state in enumerate(trace):
-            for name, var in state.items():
-                if not (isinstance(var, FNode) and var.is_symbol()):
-                    continue
-                agg = aggregates.get(name)
-                if agg is None:
-                    agg = Symbol(_safe(name), ArrayType(INT, var.symbol_type()))
-                    aggregates[name] = agg
-                subs[var] = Select(agg, Int(t))
+        trace = self.make_path(bound)
+        constraints = self.path_constraints(trace)
 
-        def _sort(ty) -> str:
-            if ty.is_array_type():
-                return f"(Array {_sort(ty.index_type)} {_sort(ty.elem_type)})"
-            return "Int" if ty == INT else "Real"
+        arrays, subs, shapes = self.build_arrays(trace)
+        self.aggregate_cache = (bound, arrays, subs, shapes)
 
         decls = "\n".join(
-            f"(declare-fun {agg} () {_sort(agg.symbol_type())})"
-            for agg in aggregates.values()
-        )
-        constraints_str = "\n  ".join(
-            to_smtlib(substitute(c, subs), daggify=False) for c in constraints
+            f"(declare-fun {array} () {_smt_sort(array.symbol_type())})"
+            for array in arrays.values()
         )
 
+        assertion = to_smtlib(substitute(And(*constraints), subs), daggify=False)
+        assertion = "\n".join(re.split(r'(?<=\))', assertion)).strip()
+
         with open(path, "w") as f:
-            f.write( f"(set-logic ALL)\n{decls}\n(assert\n  (and\n  {constraints_str}\n  )\n)\n(check-sat)\n(get-model)\n")
+            f.write(
+                f"(set-logic ALL)\n"
+                f"{decls}\n(assert\n  {assertion}\n)\n"
+                f"(check-sat)\n(get-model)\n"
+            )
+
+    # skip the SMT-LIB export of the concrete trace and directly write the SMT-LIB file with assertions for each variable at each step.
+    def _write_concrete_smtlib(self, path: str, bound: int):
+        if self.trace is None:
+            raise ValueError(
+                "concrete export needs the flat trace; build the system via from_json."
+            )
+
+        state0 = self.make_state(0)
+        array_types: dict[str, Any] = {}
+        layout: dict[str, tuple] = {}
+        for name, symbol in state0.items():
+            if not (isinstance(symbol, FNode) and symbol.is_symbol()):
+                continue
+            indices = [int(i) for i in list_index_pattern.findall(name)]
+            array_name = _safe(list_index_pattern.sub("", name))
+            if array_name not in array_types:
+                element_type = symbol.symbol_type()
+                for _ in indices:
+                    element_type = ArrayType(INT, element_type)
+                array_types[array_name] = ArrayType(INT, element_type)
+            vp = self.profile.variables.get(name)
+            layout[name] = (array_name, indices,
+                            bool(vp and vp.is_list),
+                            vp.list_len if (vp and vp.is_list) else 0)
+
+        owners: dict[str, int] = {}
+        for entry in layout.values():
+            owners[entry[0]] = owners.get(entry[0], 0) + 1
+
+        def select_str(name: str, step: int) -> str:
+            array_name, indices, _is_list, _length = layout[name]
+            expr = f"(select {array_name} {step})"
+            for index in indices:
+                expr = f"(select {expr} {index})"
+            return expr
+
+        steps = min(bound + 1, len(self.trace))
+        const_once: set[str] = set()
+
+        with open(path, "w") as f:
+            f.write("(set-logic ALL)\n")
+            for array_name, ty in array_types.items():
+                f.write(f"(declare-fun {array_name} () {_smt_sort(ty)})\n")
+            for name in self.derivations:
+                f.write(f"(declare-fun {name} () (Array Int Real))\n")
+
+            # a constant array fixes every step in one assertion 
+            for name, val in self.constants.items():
+                entry = layout.get(name)
+                if entry is None or entry[1] or owners[entry[0]] != 1:
+                    continue
+                sort = _smt_sort(array_types[entry[0]])
+                f.write(f"(assert (= {entry[0]} ((as const {sort}) {_real_str(val)})))\n")
+                const_once.add(name)
+
+            for i in range(steps):
+                row = self.trace[i]
+                for name in self.var_names:
+                    if name in const_once or name not in row:
+                        continue
+                    vp = self.profile.variables[name]
+                    val = row[name]
+                    if vp.is_list:
+                        if isinstance(val, tuple):
+                            base = select_str(name, i)
+                            for j, element in enumerate(val):
+                                if not _is_nan(element):
+                                    f.write(f"(assert (= (select {base} {j}) {_real_str(float(element))}))\n")
+                    elif not _is_nan(val) and not isinstance(val, str):
+                        f.write(f"(assert (= {select_str(name, i)} {_real_str(float(val))}))\n")
+                if self.model_time and "timestamp" in row:
+                    f.write(f"(assert (= {select_str('timestamp', i)} {_real_str(row['timestamp'])}))\n")
+                for name, fn in self.derivations.items():
+                    try:
+                        val = fn(self.trace, i)
+                    except (KeyError, TypeError, ZeroDivisionError, IndexError, ValueError):
+                        val = None
+                    if val is not None and not _is_nan(val):
+                        f.write(f"(assert (= (select {name} {i}) {_real_str(float(val))}))\n")
+
+            f.write("(check-sat)\n(get-model)\n")

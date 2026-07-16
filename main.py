@@ -29,8 +29,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-b", "--bound",
         type=int,
-        default=25,
-        help="Bound on the length of traces to check (default: 25).",
+        default=None,
+        help="Bound on the length of traces to check (default: full trace length).",
     )
     parser.add_argument(
         "-o", "--output",
@@ -53,8 +53,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-list-items",
         type=int,
-        default=2,
-        help="Max number of items to keep when flattening lists (default: 2).",
+        default=0,
+        help="Max number of items to keep when flattening lists (0 = unbounded, keep all; default: 0).",
     )
     parser.add_argument(
         "--margin",
@@ -82,20 +82,22 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Loading: {args.path}")
     ts = from_json(args.path, opts=opts, margin_pct=args.margin)
 
-    if args.standard_checks:
-        run_standard_checks(ts, bound=args.bound)
-    else:
-        speed_var = "ego_vehicle_kinematicks.ego_vehicle_kinematicks.x"
-        limit = 100.0
-        ts.check(
-            f"G({ts._short_name(speed_var)} <= {limit})",
-            lambda p, n=speed_var, hi=limit: ts.ltl_G(
-                p, lambda s, n=n, hi=hi: LE(s[n], _real(hi))
-            ),
-            args.bound,
-        )
+    bound = args.bound if args.bound is not None else ts.profile.num_steps - 1
 
-    ts.to_smtlib(args.output, bound=args.bound, concrete=args.concrete)
+    if args.standard_checks:
+        run_standard_checks(ts, bound=bound)
+    # else:
+        # speed_var = "ego_vehicle_kinematicks.ego_vehicle_kinematicks.x"
+        # limit = 100.0
+        # ts.check(
+        #     f"G({ts._short_name(speed_var)} <= {limit})",
+        #     lambda p, n=speed_var, hi=limit: ts.ltl_G(
+        #         p, lambda s, n=n, hi=hi: LE(s[n], _real(hi))
+        #     ),
+        #     args.bound,
+        # )
+
+    ts.to_smtlib(args.output, bound=bound, concrete=args.concrete)
     print(f"done: wrote {args.output}")
 
 

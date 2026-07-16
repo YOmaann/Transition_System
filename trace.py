@@ -210,8 +210,19 @@ def _default_timestamps(data: dict) -> list[float]:
     series = discover_time_series(data)
     if not series:
         return []
+
+    # the densest stream becomes the promary key.
+    # a single element \notin the primary key is linked to the nearest primary key element.
     primary_key = max(series, key=lambda k: len(series[k]))
-    return [r["timestamp"] for r in series[primary_key]]
+    seen: set[float] = set()
+    timestamps: list[float] = []
+    for key in [primary_key] + [k for k in series if k != primary_key]:
+        for r in series[key]:
+            t = r["timestamp"]
+            if t not in seen:
+                seen.add(t)
+                timestamps.append(t)
+    return sorted(timestamps)
 
 
 def states_at_one(data: dict, t: float,
@@ -227,7 +238,10 @@ def states_at_one(data: dict, t: float,
         if nearest is None:
             per_stream.append([{}])
             continue
-        per_stream.append(flatten_record(nearest, prefix=stream_name, opts=opts))
+        records = flatten_record(nearest, prefix=stream_name, opts=opts)
+        for record in records:
+            record[f"{stream_name}.timestamp"] = float(nearest["timestamp"])
+        per_stream.append(records)
 
     states: list[dict[str, Any]] = []
     for combo in product(*per_stream) if per_stream else [()]:

@@ -139,37 +139,37 @@ def profile_trace(trace: list[dict[str, Any]], margin_pct: float = 0.15) -> Trac
         vp.is_list = is_list
         vp.list_len = int(len_max) if is_list else 0
 
-        sorted_vals = sorted(elements)
-        n = len(sorted_vals)
+        # constants have a single value: percentiles and deltas are trivial, so
+        # skip the sort and the monotonicity scan for them.
+        if vp.is_constant:
+            vp.q25 = vp.q75 = vp.min_val
+        else:
+            sorted_vals = sorted(elements)
+            n = len(sorted_vals)
 
-        # compute 25th and 75th percentiles for the variable values across the trace.
-        vp.q25 = sorted_vals[n // 4]
-        vp.q75 = sorted_vals[3 * n // 4]
+            # compute 25th and 75th percentiles for the variable values across the trace.
+            vp.q25 = sorted_vals[n // 4]
+            vp.q75 = sorted_vals[3 * n // 4]
 
-        # if the variable is not a list and has multiple unique state (not a constant), compute deltas b/w states and check if it is increasing/decreasing/monotone. This can be useful for checking monotonicity properties later.
-        if not is_list and len(block_reps) > 1:
-            rep_vals = [] # values between unique states (ignoring dublicates).
-            for s in block_reps:
-                v = s.get(name)
-                if v is None or _is_nan(v):
-                    rep_vals.append(None)
-                else:
-                    rep_vals.append(float(v))
-            deltas = [rep_vals[i + 1] - rep_vals[i]
-                      for i in range(len(rep_vals) - 1)
-                      if rep_vals[i] is not None and rep_vals[i + 1] is not None]
-            if deltas:
-                # profile deltas
-                vp.min_delta = min(deltas)
-                vp.max_delta = max(deltas)
-                vp.is_monotone_inc = all(d >= 0 for d in deltas)
-                vp.is_monotone_dec = all(d <= 0 for d in deltas)
+            # if the variable is not a list, compute deltas b/w states and check if it is increasing/decreasing/monotone.
+            if not is_list and len(block_reps) > 1:
+                rep_vals = [] # values between unique states (ignoring dublicates).
+                for s in block_reps:
+                    v = s.get(name)
+                    if v is None or _is_nan(v):
+                        rep_vals.append(None)
+                    else:
+                        rep_vals.append(float(v))
+                deltas = [rep_vals[i + 1] - rep_vals[i]
+                          for i in range(len(rep_vals) - 1)
+                          if rep_vals[i] is not None and rep_vals[i + 1] is not None]
+                if deltas:
+                    # profile deltas
+                    vp.min_delta = min(deltas)
+                    vp.max_delta = max(deltas)
+                    vp.is_monotone_inc = all(d >= 0 for d in deltas)
+                    vp.is_monotone_dec = all(d <= 0 for d in deltas)
 
-        # storew the concrete values.
-        vp.values = tuple(
-            x for v in per_state if v is not None for x in per_element(v)
-        )
-
-        prof.variables[name] = vp  
+        prof.variables[name] = vp
 
     return prof
