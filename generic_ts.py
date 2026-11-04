@@ -25,7 +25,6 @@ from pysmt.shortcuts import (
     Select,
     Solver,
     Symbol,
-    substitute,
 )
 from pysmt.typing import INT, REAL, ArrayType
 
@@ -481,13 +480,13 @@ class GenericTransitionSystem:
         return Or(*clauses)
 
     def check(self, name: str, phi_fn: Callable, bound: int = 25,
-              extra_constraints: Callable | None = None, timeout_ms: int = 30000,
-              concrete: bool = False):
+              extra_constraints: Callable | None = None, timeout_ms: int = 30000):
+        if self.trace is not None:
+            bound = min(bound, len(self.trace) - 1)
         path = self.make_path(bound)
         solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
         solver.add_assertions(self.path_constraints(path))
-        if concrete:
-            solver.add_assertions(self.concrete_constraints(path))
+        solver.add_assertions(self.concrete_constraints(path))
         if extra_constraints:
             solver.add_assertion(extra_constraints(path))
 
@@ -510,12 +509,13 @@ class GenericTransitionSystem:
         return result
 
     def check_reachable(self, name: str, target_fn: Callable, bound: int = 25,
-                        timeout_ms: int = 30000, concrete: bool = False):
+                        timeout_ms: int = 30000):
+        if self.trace is not None:
+            bound = min(bound, len(self.trace) - 1)
         path = self.make_path(bound)
         solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
         solver.add_assertions(self.path_constraints(path))
-        if concrete:
-            solver.add_assertions(self.concrete_constraints(path))
+        solver.add_assertions(self.concrete_constraints(path))
         solver.add_assertion(target_fn(path))
 
         try:
@@ -691,34 +691,8 @@ class GenericTransitionSystem:
                   f"{vp.min_delta:>10.4f} {vp.max_delta:>10.4f} {float(init_disp):>10.3f}")
         print()
 
-    # get output in SMT-LIB format for use with other tools.
-    # concrete=True also pins every variable to its logged value, so the
-    # exported problem describes exactly the recorded run.
-    def to_smtlib(self, path: str, bound: int = 25, concrete: bool = False):
-        if concrete:
-            self._write_concrete_smtlib(path, bound)
-            return
-
-        trace = self.make_path(bound)
-        constraints = self.path_constraints(trace)
-
-        arrays, subs, shapes = self.build_arrays(trace)
-        self.aggregate_cache = (bound, arrays, subs, shapes)
-
-        decls = "\n".join(
-            f"(declare-fun {array} () {_smt_sort(array.symbol_type())})"
-            for array in arrays.values()
-        )
-
-        assertion = to_smtlib(substitute(And(*constraints), subs), daggify=False)
-        assertion = "\n".join(re.split(r'(?<=\))', assertion)).strip()
-
-        with open(path, "w") as f:
-            f.write(
-                f"(set-logic ALL)\n"
-                f"{decls}\n(assert\n  {assertion}\n)\n"
-                f"(check-sat)\n(get-model)\n"
-            )
+    def to_smtlib(self, path: str, bound: int = 25):
+        self._write_concrete_smtlib(path, bound)
 
     # skip the SMT-LIB export of the concrete trace and directly write the SMT-LIB file with assertions for each variable at each step.
     def _write_concrete_smtlib(self, path: str, bound: int):
