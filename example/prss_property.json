@@ -1,0 +1,18 @@
+{
+  "mappings": [
+    {"array": "ego_estimated_kinematic", "variable": "twist.linear.x", "alias": "ego_speed"},
+    {"array": "ego_estimated_kinematic", "variable": "pose.position.x", "alias": "ego_x"},
+    {"array": "perception_objects", "variable": "objects[0].twist.linear.x", "alias": "lead_vx"},
+    {"array": "perception_objects", "variable": "objects[0].twist.linear.y", "alias": "lead_vy"},
+    {"array": "perception_objects", "variable": "objects[0].pose.position.x", "alias": "lead_x"}
+  ],
+  "derived": {
+    "q": "lead_vx**2 + lead_vy**2",
+    "k": "abs(lead_x - ego_x) - 1 - ego_speed*(3/5) - 3*(3/5)**2/2 - (ego_speed + (3/5)*3)**2/8 - (ego_speed + 3/2)*(3/5) - (3+8)*(3/5)**2/2",
+    "threshold_sq": "(3/2 + 8*(3/5))**2",
+    "l": "2*8*k + q + threshold_sq"
+  },
+  "property": {
+    "expression": "(q <= threshold_sq and (k >= 0 or (3/5)**2*q >= k**2)) or (q > threshold_sq and l >= 0 and l**2 >= 4*(3/2)**2*q)"
+  }
+}

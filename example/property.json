@@ -1,0 +1,17 @@
+{
+  "mappings": [
+    {
+      "array": "ego_vehicle_kinematicks",
+      "variable": "ego_vehicle_kinematicks.x",
+      "alias": "ego_x"
+    },
+    {
+      "array": "npc_vehicle_kinematicks",
+      "variable": "npc_vehicle_kinematicks.x",
+      "alias": "npc_x"
+    }
+  ],
+  "property": {
+    "expression": "(npc_x - ego_x) ** 2 >= 4"
+  }
+}

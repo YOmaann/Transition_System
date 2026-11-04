@@ -1,50 +1,23 @@
 from fractions import Fraction
 from functools import lru_cache
 import re
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
-from pysmt.exceptions import SolverReturnedUnknownResultError
 from pysmt.fnode import FNode
 from pysmt.smtlib.printers import to_smtlib
-from pysmt.shortcuts import (
-    And,
-    Bool,
-    Equals,
-    Exists,
-    ForAll,
-    GE,
-    GT,
-    Implies,
-    Int,
-    LE,
-    LT,
-    Minus,
-    Not,
-    Or,
-    Real,
-    Select,
-    Solver,
-    Symbol,
-)
+from pysmt.shortcuts import Symbol, Select, Int, Real
 from pysmt.typing import INT, REAL, ArrayType
 
-from profiles import VarProfile, TraceProfile
+from profiles import TraceProfile
 from utils.helper import _safe, _is_nan
 
-
-StateFn = Callable[[dict], FNode]
 
 list_index_pattern = re.compile(r"\[(\d+)\]")
 
 
 @lru_cache(maxsize=None)
-def _real(value: float | int) -> FNode:
-    return Real(Fraction(str(value)))
-
-
-@lru_cache(maxsize=None)
 def _real_str(value: float | int) -> str:
-    return to_smtlib(_real(value), daggify=False)
+    return to_smtlib(Real(Fraction(str(value))), daggify=False)
 
 
 def _smt_sort(ty) -> str:
@@ -52,661 +25,41 @@ def _smt_sort(ty) -> str:
         return f"(Array {_smt_sort(ty.index_type)} {_smt_sort(ty.elem_type)})"
     return "Int" if ty == INT else "Real"
 
-# Generic transition system built from a trace profile.
+
 class GenericTransitionSystem:
-
-    def __init__(self, profile: TraceProfile, skip_constant: bool = False,
-                 exact_initial: bool = False, use_invariants: bool = True,
-                 model_time: bool = False,
-                 trace: list[dict] | None = None):
-        self.profile = profile # trace profile containing variable profiles.
-        self.exact_initial = exact_initial # whether to enforce exact initial values.
-        self.use_invariants = use_invariants # add invariant constraints based on variable ranges (constants and booleans are always invariant).
-        self.model_time = model_time # is time needs to be modeled in a variable.
-        self.trace = trace # the concrete flat trace, kept so a run can be pinned exactly (see concrete_constraints).
-
-        # you can skip constants if you want.
-        if skip_constant:
-            self.var_names = [n for n in profile.variable_names()
-                              if not profile.variables[n].is_constant]
-        else:
-            self.var_names = profile.variable_names()
-        self.constants: dict[str, float] = {
-            n: float(vp.initial) for n, vp in profile.variables.items()
+    def __init__(self, profile: TraceProfile, trace: list[dict] | None = None,
+                 model_time: bool = False):
+        self.profile = profile
+        self.trace = trace
+        self.model_time = model_time
+        self.var_names = profile.variable_names()
+        self.constants = {
+            name: float(vp.initial)
+            for name, vp in profile.variables.items()
             if vp.is_constant and not vp.is_list
         }
-        self.propositions: dict[str, StateFn] = {}
-        self._custom_invariants: list[StateFn] = []
         self.derivations: dict[str, Callable[[list, int], Any]] = {}
-        self.aggregate_cache: tuple | None = None
-        self._build_propositions()
 
-    # make state variables for a given timestamp t. vars are named {varname}_{t} for scalars and {varname}_{i}_{t} for lists}
-    def make_state(self, t: int) -> dict[str, Any]:
-        state: dict[str, Any] = {}
-        for name in self.var_names:
-            vp = self.profile.variables[name]
-            base = _safe(name)
-
-            if vp.is_list:
-                # state[name] = tuple(
-                #     Symbol(f"{base}_{i}_{t}", REAL) for i in range(vp.list_len)
-                # )
-                # now creating variables in a list
-                state[name] = Symbol(f"{base}_{t}", ArrayType(INT, REAL))
-            else:
-                # state[name] = Symbol(f"{base}_{t}", REAL)
-                # now creating variables in a list
-                state[name] = Symbol(f"{base}_{t}", REAL)
-                # self.profile.variables[name].values = self.profile.variables[name].values.Store(Symbol(f"{base}", REAL))
-        # constants are kept symbolic (as arrays after aggregation) so they get
-        # declared and bound in the SMT-LIB output instead of folding into literals.
-        for name in self.constants:
-            if name not in state:
-                state[name] = Symbol(f"{_safe(name)}_{t}", REAL)
-        if self.model_time:
-            state["timestamp"] = Symbol(f"timestamp_{t}", REAL)
-        return state
-
-    # returns a list of FNode elements for a list variable in state s.
-    def _elems(self, s: dict, name: str) -> list[FNode]:
-        vp = self.profile.variables[name]
-        arr = s[name]
-        return [Select(arr, Int(i)) for i in range(vp.list_len)]
-
-    # map an index label to a symbolic integert variable. 
-    def index(self, label: str = "i") -> FNode:
-        return Symbol(f"_idx_{label}", INT)
-
-    # bound the value of i based on rthe length ogf the list.
-    def in_range(self, name: str, i: FNode, upper: int | None = None) -> FNode:
-        length = upper if upper is not None else self.profile.variables[name].list_len
-        return And(GE(i, Int(0)), LT(i, Int(length)))
-
-    # element access a[i] for a (possibly symbolic) index i.
-    def at(self, s: dict, name: str, i: FNode) -> FNode:
-        return Select(s[name], i)
-
-    # yields: forall i.. . (each i in range of its list) -> body.
-    # each binding is (name, index) or (name, index, upper_bound).
-    def forall_idx(self, bindings: Sequence[tuple], body: FNode) -> FNode:
-        idxs = [binding[1] for binding in bindings]
-        guard = And(*[
-            self.in_range(binding[0], binding[1],
-                          binding[2] if len(binding) > 2 else None)
-            for binding in bindings
-        ])
-        return ForAll(idxs, Implies(guard, body))
-
-    # generic existential query over one or more indices.
-    def exists_idx(self, bindings: Sequence[tuple[str, FNode]], body: FNode) -> FNode:
-        idxs = [i for _, i in bindings]
-        guard = And(*[self.in_range(name, i) for name, i in bindings])
-        return Exists(idxs, And(guard, body))
-
-    # collapse the per-step, per-index symbols of a path into one nested-array
-    def build_arrays(self, path: list[dict]):
-        arrays: dict[str, FNode] = {}
-        substitutions: dict[FNode, FNode] = {}
-        dimension_sizes: dict[str, list[int]] = {}
-        element_length: dict[str, int] = {}
-        name_parts: dict[str, tuple[str, list[int]]] = {}
-
-        for step, state in enumerate(path):
-            for name, symbol in state.items():
-                if not (isinstance(symbol, FNode) and symbol.is_symbol()):
-                    continue
-
-                parts = name_parts.get(name)
-                if parts is None:
-                    indices = [int(i) for i in list_index_pattern.findall(name)]
-                    parts = (_safe(list_index_pattern.sub("", name)), indices)
-                    name_parts[name] = parts
-                array_name, indices = parts
-
-                array = arrays.get(array_name)
-                if array is None:
-                    element_type = symbol.symbol_type()
-                    for _ in indices:
-                        element_type = ArrayType(INT, element_type)
-                    array = Symbol(array_name, ArrayType(INT, element_type))
-                    arrays[array_name] = array
-                    dimension_sizes[array_name] = [0] * len(indices)
-                    vp = self.profile.variables.get(name)
-                    element_length[array_name] = vp.list_len if (vp and vp.is_list) else 0
-
-                sizes = dimension_sizes[array_name]
-                for position, index in enumerate(indices):
-                    if index > sizes[position]:
-                        sizes[position] = index
-
-                selection = Select(array, Int(step))
-                for index in indices:
-                    selection = Select(selection, Int(index))
-                substitutions[symbol] = selection
-
-        num_steps = len(path)
-        shapes: dict[str, tuple[int, ...]] = {}
-        for array_name in arrays:
-            dims = [num_steps] + [size + 1 for size in dimension_sizes[array_name]]
-            if element_length[array_name]:
-                dims.append(element_length[array_name])
-            shapes[array_name] = tuple(dims)
-        return arrays, substitutions, shapes
-
-    def _arrays(self, bound: int):
-        if self.aggregate_cache is None or self.aggregate_cache[0] != bound:
-            self.aggregate_cache = (bound, *self.build_arrays(self.make_path(bound)))
-        return self.aggregate_cache[1], self.aggregate_cache[2], self.aggregate_cache[3]
-
-    # per-dimension sizes of a nested-array variable, usable as forall bounds.
-    def array_shape(self, name: str, bound: int = 25) -> tuple[int, ...]:
-        return self._arrays(bound)[2][name]
-
-    # the nested-array symbol for a variable, e.g. to index it in a property.
-    def array(self, name: str, bound: int = 25) -> FNode:
-        return self._arrays(bound)[0][name]
-
-    def array_forall(self, name: str,
-                     make_body: Callable[[FNode, list[FNode]], FNode],
-                     bound: int = 25,
-                     labels: Sequence[str] | None = None) -> FNode:
-        arrays, _, shapes = self._arrays(bound)
-        shape = shapes[name]
-        array = arrays[name]
-        labels = labels or [f"d{dimension}" for dimension in range(len(shape))]
-        indices = [self.index(label) for label in labels]
-
-        element = array
-        for index in indices:
-            element = Select(element, index)
-        guard = And(*[
-            And(GE(index, Int(0)), LT(index, Int(size)))
-            for index, size in zip(indices, shape)
-        ])
-        return ForAll(indices, Implies(guard, make_body(element, indices)))
-
-    # make states and add concrete (python) timestamp for each state in the path.
-    def symbolic_states_at(self, timestamps: Sequence[float]) -> list[dict[str, Any]]:
-        path = []
-        for i, t in enumerate(timestamps):
-            s = self.make_state(i)
-            s["_t_concrete"] = float(t)
-            path.append(s)
-        return path
-
-    # for each state in path, make time variable equal to the given timestamp.
-    def pin_time(self, path: list[dict], timestamps: Sequence[float]) -> list:
-        if not self.model_time:
-            raise ValueError("pin_time requires model_time=True")
-        return [
-            Equals(path[i]["timestamp"], _real(timestamps[i]))
-            for i in range(len(timestamps))
-        ]
-
-    # create initial constraints based on the initial value in the profile.
-    def initial_constraints(self, s0: dict) -> list:
-        constraints = []
-        # for each variable in the state.
-        for name in self.var_names:
-            vp = self.profile.variables[name]
-            if vp.is_list:
-                init = vp.initial if isinstance(vp.initial, tuple) else (float(vp.initial),) * vp.list_len
-                for i, x in enumerate(self._elems(s0, name)):
-                    if self.exact_initial:
-                        constraints.append(Equals(x, _real(init[i])))
-                    else:
-                        margin = self._margin(vp)
-                        constraints.append(GE(x, _real(float(init[i]) - margin)))
-                        constraints.append(LE(x, _real(float(init[i]) + margin)))
-            elif self.exact_initial or vp.is_boolean:
-                # exact initial - initial values should be exact
-                constraints.append(Equals(s0[name], _real(vp.initial))) # add variable with initial value 
-            else:
-                # if not exact initial - initial values should not be exact.
-                margin = self._margin(vp)
-                constraints.append(GE(s0[name], _real(float(vp.initial) - margin)))
-                constraints.append(LE(s0[name], _real(float(vp.initial) + margin)))
-
-        # add time as a variable
-        if self.model_time:
-            ti = self.profile.time_initial
-            if self.exact_initial:
-                constraints.append(Equals(s0["timestamp"], _real(ti)))
-            else:
-                tm = self._time_margin()
-                constraints.append(GE(s0["timestamp"], _real(ti - tm)))
-                constraints.append(LE(s0["timestamp"], _real(ti + tm)))
-        return constraints
-
-    # add invariant constraints if provided.
-    def invariant_constraints(self, s: dict) -> list:
-        constraints = []
-        for name in self.var_names:
-            vp = self.profile.variables[name]
-            if vp.is_constant and not vp.is_list:
-                continue  # pinned exactly below
-            xs = self._elems(s, name) if vp.is_list else (s[name],)
-            for x in xs:
-                if vp.is_boolean:
-                    constraints.append(
-                        Or(Equals(x, _real(0)), Equals(x, _real(1)))
-                    )
-                elif self.use_invariants:
-                    margin = self._margin(vp)
-                    constraints.append(GE(x, _real(vp.min_val - margin)))
-                    constraints.append(LE(x, _real(vp.max_val + margin)))
-        if self.model_time and self.use_invariants:
-            tm = self._time_margin()
-            constraints.append(GE(s["timestamp"], _real(self.profile.time_min - tm)))
-            constraints.append(LE(s["timestamp"], _real(self.profile.time_max + tm)))
-        # pin every scalar constant to its value at each state so it shows up as a
-        # bound array element (= (select c t) v) rather than a folded literal.
-        for name, val in self.constants.items():
-            if name in s:
-                constraints.append(Equals(s[name], _real(val)))
-        for inv_fn in self._custom_invariants:
-            constraints.append(inv_fn(s))
-        return constraints
-
-    def add_invariant(self, fn: StateFn):
-        self._custom_invariants.append(fn)
-
-    def add_derivation(self, name: str, fn: Callable[[list, int], Any]):
+    def add_derivation(self, name: str, fn: Callable[[list, int], Any]) -> None:
         self.derivations[_safe(name)] = fn
 
-    # add transition constraints based on monotonicity and time deltas.
-    def transition_constraints(self, s_curr: dict, s_next: dict) -> list:
-        constraints = []
-        for name in self.var_names:
-            vp = self.profile.variables[name]
-            if vp.is_constant or vp.is_list:
-                continue
-            delta = Minus(s_next[name], s_curr[name])
-            if vp.is_monotone_inc:
-                constraints.append(GE(delta, _real(0))) # increasing value constraint
-            if vp.is_monotone_dec:
-                constraints.append(LE(delta, _real(0))) # decreasing value constraint
-        if self.model_time:
-            dt = Minus(s_next["timestamp"], s_curr["timestamp"])
-            constraints.append(GE(dt, _real(0))) # time must advance
-            tm = self._time_margin()
-            dmin = max(self.profile.time_min_delta - tm, 0.0)
-            dmax = self.profile.time_max_delta + tm
-            if dmax > 0:
-                constraints.append(GE(dt, _real(dmin)))
-                constraints.append(LE(dt, _real(dmax)))
-        return constraints
-
-    def _margin(self, vp: VarProfile) -> float:
-        return max((vp.max_val - vp.min_val) * self.profile.margin_pct, 0.01)
-
-    def _time_margin(self) -> float:
-        return max((self.profile.time_max - self.profile.time_min) * self.profile.margin_pct, 0.01)
-
-    def make_path(self, k: int) -> list[dict]:
-        return [self.make_state(t) for t in range(k + 1)]
-
-    # returns transitions constraints for the entire path (invariant and initial included.)
-    def path_constraints(self, path: list[dict]) -> list:
-        c = []
-        c.extend(self.initial_constraints(path[0]))
-        for s in path:
-            c.extend(self.invariant_constraints(s))
-        for i in range(len(path) - 1):
-            c.extend(self.transition_constraints(path[i], path[i + 1]))
-        return c
-
-
-    def concrete_constraints(self, path: list[dict], trace: list[dict] | None = None) -> list:
-        trace = trace if trace is not None else self.trace
-        if trace is None:
-            raise ValueError(
-                "concrete_constraints needs the flat trace; pass trace=... "
-                "or build the system via from_json (which stores it)."
-            )
-        constraints = []
-        steps = min(len(path), len(trace))
-        for i in range(steps):
-            state, row = path[i], trace[i]
-            for name in self.var_names:
-                if name not in row:
-                    continue
-                vp = self.profile.variables[name]
-                val = row[name]
-                if vp.is_list:
-                    if isinstance(val, tuple):
-                        for x, v in zip(self._elems(state, name), val):
-                            if not _is_nan(v):
-                                constraints.append(Equals(x, _real(float(v))))
-                elif not _is_nan(val) and not isinstance(val, str):
-                    constraints.append(Equals(state[name], _real(float(val))))
-            if self.model_time and "timestamp" in row:
-                constraints.append(Equals(state["timestamp"], _real(row["timestamp"])))
-        return constraints
-
-    # create propositions based on variable profiles. 
-    def _build_propositions(self):
-        for name, vp in self.profile.variables.items():
-            if vp.is_constant:
-                continue
-            base = _safe(name) # sanitize name.
-            if vp.is_list:
-                if vp.is_boolean:
-                    self.propositions[f"{base}_any_true"] = (
-                        lambda s, n=name: Or(*[GE(x, _real(0.5)) for x in self._elems(s, n)])) # if any element in the list is true (>= 0.5), then the proposition holds.
-                    self.propositions[f"{base}_all_true"] = (
-                        lambda s, n=name: And(*[GE(x, _real(0.5)) for x in self._elems(s, n)]))
-                else:
-                    self.propositions[f"{base}_any_high"] = (
-                        lambda s, n=name, th=vp.q75: Or(
-                            *[GT(x, _real(th)) for x in self._elems(s, n)]
-                        ))
-                    self.propositions[f"{base}_all_low"] = (
-                        lambda s, n=name, th=vp.q25: And(
-                            *[LT(x, _real(th)) for x in self._elems(s, n)]
-                        ))
-                    if vp.min_val <= 0 <= vp.max_val:
-                        eps = max((vp.max_val - vp.min_val) * 0.05, 0.01)
-                        self.propositions[f"{base}_any_near_zero"] = (
-                            lambda s, n=name, e=eps: Or(*[
-                                And(GE(x, _real(-e)), LE(x, _real(e)))
-                                for x in self._elems(s, n)
-                            ]))
-            elif vp.is_boolean:
-                self.propositions[f"{base}_true"] = lambda s, n=name: GE(s[n], _real(0.5))
-                self.propositions[f"{base}_false"] = lambda s, n=name: LT(s[n], _real(0.5))
-            else:
-                self.propositions[f"{base}_high"] = (
-                    lambda s, n=name, th=vp.q75: GT(s[n], _real(th)))
-                self.propositions[f"{base}_low"] = (
-                    lambda s, n=name, th=vp.q25: LT(s[n], _real(th)))
-                if vp.min_val <= 0 <= vp.max_val:
-                    eps = max((vp.max_val - vp.min_val) * 0.05, 0.01)
-                    self.propositions[f"{base}_near_zero"] = (
-                        lambda s, n=name, e=eps: And(
-                            GE(s[n], _real(-e)), LE(s[n], _real(e))
-                        ))
-
-    def get_prop(self, prop_name: str) -> StateFn:
-        if prop_name not in self.propositions:
-            available = sorted(self.propositions.keys())
-            raise KeyError(
-                f"Unknown proposition '{prop_name}'. "
-                f"Available: {available[:20]}{'...' if len(available) > 20 else ''}"
-            )
-        return self.propositions[prop_name]
-
-    def add_proposition(self, name: str, fn: StateFn):
-        self.propositions[name] = fn
-
-    def exists_element(self, s: dict, name: str, pred: Callable[[Any], Any]):
-        return Or(*[pred(x) for x in self._elems(s, name)])
-
-    def forall_element(self, s: dict, name: str, pred: Callable[[Any], Any]):
-        return And(*[pred(x) for x in self._elems(s, name)])
-
-    @staticmethod
-    def ltl_G(path: list[dict], prop_fn: StateFn):
-        return And(*[prop_fn(s) for s in path])
-
-    @staticmethod
-    def ltl_F(path: list[dict], prop_fn: StateFn):
-        return Or(*[prop_fn(s) for s in path])
-
-    @staticmethod
-    def ltl_G_imp(path: list[dict], p_fn: StateFn, q_fn: StateFn):
-        return And(*[Implies(p_fn(s), q_fn(s)) for s in path])
-
-    @staticmethod
-    def ltl_G_imp_F(path: list[dict], trigger_fn: StateFn, target_fn: StateFn,
-                    horizon: int | None = None):
-        k = len(path)
-        h = horizon or k
-        clauses = []
-        for i in range(k):
-            future = Or(*[target_fn(path[j]) for j in range(i, min(i + h, k))])
-            clauses.append(Implies(trigger_fn(path[i]), future))
-        return And(*clauses)
-
-    @staticmethod
-    def ltl_neg_U(path: list[dict], forbidden_fn: StateFn, trigger_fn: StateFn):
-        clauses = []
-        for j in range(len(path)):
-            q_at_j = trigger_fn(path[j])
-            p_false_before = (And(*[Not(forbidden_fn(path[i])) for i in range(j)])
-                              if j > 0 else Bool(True))
-            clauses.append(And(q_at_j, p_false_before))
-        return Or(*clauses)
-
-    def check(self, name: str, phi_fn: Callable, bound: int = 25,
-              extra_constraints: Callable | None = None, timeout_ms: int = 30000):
-        if self.trace is not None:
-            bound = min(bound, len(self.trace) - 1)
-        path = self.make_path(bound)
-        solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
-        solver.add_assertions(self.path_constraints(path))
-        solver.add_assertions(self.concrete_constraints(path))
-        if extra_constraints:
-            solver.add_assertion(extra_constraints(path))
-
-        phi = phi_fn(path)
-        solver.add_assertion(Not(phi))
-
-        try:
-            result = solver.solve()
-        except SolverReturnedUnknownResultError:
-            result = None
-        if result is False:
-            print(f"  HOLDS  :: {name}  (bound={bound})")
-        elif result is True:
-            m = solver.get_model()
-            print(f"  FAILS  :: {name}  -- counterexample:")
-            self._print_trace(m, path)
-        else:
-            print(f"  ?????  :: {name}  -- timeout / unknown")
-        print()
-        return result
-
-    def check_reachable(self, name: str, target_fn: Callable, bound: int = 25,
-                        timeout_ms: int = 30000):
-        if self.trace is not None:
-            bound = min(bound, len(self.trace) - 1)
-        path = self.make_path(bound)
-        solver = Solver(name="z3", solver_options={"timeout": timeout_ms})
-        solver.add_assertions(self.path_constraints(path))
-        solver.add_assertions(self.concrete_constraints(path))
-        solver.add_assertion(target_fn(path))
-
-        try:
-            result = solver.solve()
-        except SolverReturnedUnknownResultError:
-            result = None
-        if result is True:
-            m = solver.get_model()
-            print(f"  REACHABLE :: {name}")
-            self._print_trace(m, path)
-        elif result is False:
-            print(f"  UNREACHABLE :: {name}  (bound={bound})")
-        else:
-            print(f"  ?????  :: {name}  -- timeout")
-        print()
-        return result
-
-    def _print_trace(self, model, path: list[dict], max_vars_shown: int = 8):
-        display_vars = self._pick_display_vars(max_vars_shown)
-
-        header = f"  {'t':>3}"
-        for v in display_vars:
-            header += f" {self._short_name(v):>10}"
-        header += "  propositions"
-        print(header)
-
-        show = set(range(min(8, len(path))))
-        show |= set(range(max(0, len(path) - 5), len(path)))
-        skipped = False
-
-        for i, s in enumerate(path):
-            if i not in show:
-                if not skipped:
-                    print(f"       ... ({len(path) - 13} steps omitted)")
-                    skipped = True
-                continue
-
-            vals = self._eval_state(model, s)
-            active = self._get_active_props(vals)
-
-            row = f"  {i:>3}"
-            for v in display_vars:
-                val = vals.get(v)
-                if isinstance(val, tuple):
-                    row += f" {'|'.join(f'{x:.2f}' for x in val):>10}"
-                elif isinstance(val, float):
-                    row += f" {val:>10.3f}"
-                else:
-                    row += f" {str(val):>10}"
-            row += f"  {{{', '.join(active)}}}"
-            print(row)
-
-    def _eval_one(self, model, var) -> float | str:
-        v = model.get_value(var)
-        try:
-            value = v.constant_value()
-            if isinstance(value, Fraction):
-                return float(value)
-            return float(value)
-        except (ValueError, ArithmeticError):
-            return str(v)
-
-    def _eval_state(self, model, s: dict) -> dict[str, Any]:
-        vals: dict[str, Any] = {}
-        for key, var in s.items():
-            if key == "_t_concrete":
-                vals[key] = var
-                continue
-            vp = self.profile.variables.get(key)
-            if vp is not None and vp.is_list:
-                vals[key] = tuple(
-                    self._eval_one(model, Select(var, Int(i)))
-                    for i in range(vp.list_len)
-                )
-            elif isinstance(var, tuple):
-                vals[key] = tuple(self._eval_one(model, x) for x in var)
-            else:
-                vals[key] = self._eval_one(model, var)
-        return vals
-
-    def _get_active_props(self, vals: dict) -> list[str]:
-        active = []
-        for name, vp in sorted(self.profile.variables.items()):
-            if vp.is_constant:
-                continue
-            val = vals.get(name)
-            short = self._short_name(name)
-            if vp.is_list and isinstance(val, tuple):
-                if vp.is_boolean:
-                    if any(x >= 0.5 for x in val):
-                        active.append(f"{short}:any")
-                else:
-                    if any(x > vp.q75 for x in val):
-                        active.append(f"{short}:hi")
-                    elif all(x < vp.q25 for x in val):
-                        active.append(f"{short}:lo")
-                continue
-            if not isinstance(val, float):
-                continue
-            if vp.is_boolean:
-                if val >= 0.5:
-                    active.append(short)
-            elif val > vp.q75:
-                active.append(f"{short}:hi")
-            elif val < vp.q25:
-                active.append(f"{short}:lo")
-        return active
-
-    def _pick_display_vars(self, n: int) -> list[str]:
-        scored = []
-        for name in self.var_names:
-            vp = self.profile.variables[name]
-            if vp.is_constant:
-                continue
-            scored.append((vp.max_val - vp.min_val, name))
-        scored.sort(reverse=True)
-        seen: set[str] = set()
-        result: list[str] = []
-        for _, name in scored:
-            short = self._short_name(name)
-            if short not in seen:
-                seen.add(short)
-                result.append(name)
-                if len(result) >= n:
-                    break
-        return result
-
-    # shortens the name
-    # removes [0] and keeps only the last two parts of the name.
-    # stream_a.foo.bar[0].baz to stream_a.bar.baz
-    @staticmethod
-    def _short_name(name: str) -> str:
-        parts = name.replace("[0]", "").split(".")
-        meaningful = [p for p in parts if p not in ("0",)]
-        if len(meaningful) <= 2:
-            return ".".join(meaningful)
-        stream = meaningful[0].split("_")[0]
-        return f"{stream}.{'.'.join(meaningful[-2:])}"
-
-    def summary(self):
-        print("=" * 70)
-        print("Generic PySMT Transition System")
-        print("=" * 70)
-        print(f"  State variables   : {len(self.var_names)}")
-        print(f"  Constants         : {len(self.constants)}")
-        print(f"  Propositions      : {len(self.propositions)}")
-        print(f"  Trace length used : {self.profile.num_steps}")
-        print(f"  Blocks            : {len(self.profile.block_boundaries)}")
-        print()
-
-        bools = [n for n in self.var_names if self.profile.variables[n].is_boolean]
-        monos = [n for n in self.var_names
-                 if self.profile.variables[n].is_monotone_inc
-                 or self.profile.variables[n].is_monotone_dec]
-        lists = [n for n in self.var_names if self.profile.variables[n].is_list]
-
-        if bools:
-            print(f"  Boolean variables : {', '.join(self._short_name(b) for b in bools)}")
-        if monos:
-            print(f"  Monotone variables: {', '.join(self._short_name(m) for m in monos)}")
-        if lists:
-            print(f"  List variables    : {', '.join(self._short_name(l) for l in lists)}")
-        print()
-
-        print("  Variable profiles (top 15 by range):")
-        display = self._pick_display_vars(15)
-        print(f"    {'name':<35} {'min':>10} {'max':>10} {'dmin':>10} {'dmax':>10} {'init':>10}")
-        for name in display:
-            vp = self.profile.variables[name]
-            short = self._short_name(name)
-            init_disp = vp.initial if not isinstance(vp.initial, tuple) else float(vp.initial[0])
-            print(f"    {short:<35} {vp.min_val:>10.3f} {vp.max_val:>10.3f} "
-                  f"{vp.min_delta:>10.4f} {vp.max_delta:>10.4f} {float(init_disp):>10.3f}")
-        print()
-
-    def to_smtlib(self, path: str, bound: int = 25):
-        self._write_concrete_smtlib(path, bound)
-
-    # skip the SMT-LIB export of the concrete trace and directly write the SMT-LIB file with assertions for each variable at each step.
-    def _write_concrete_smtlib(self, path: str, bound: int):
+    def to_smtlib(self, path: str, bound: int = 25) -> None:
         if self.trace is None:
-            raise ValueError(
-                "concrete export needs the flat trace; build the system via from_json."
-            )
+            raise ValueError("concrete export needs a trace")
 
-        state0 = self.make_state(0)
+        symbols: dict[str, FNode] = {}
+        for name in self.var_names:
+            vp = self.profile.variables[name]
+            ty = ArrayType(INT, REAL) if vp.is_list else REAL
+            symbols[name] = Symbol(f"{_safe(name)}_0", ty)
+        for name in self.constants:
+            symbols.setdefault(name, Symbol(f"{_safe(name)}_0", REAL))
+        if self.model_time:
+            symbols["timestamp"] = Symbol("timestamp_0", REAL)
+
         array_types: dict[str, Any] = {}
-        layout: dict[str, tuple] = {}
-        for name, symbol in state0.items():
-            if not (isinstance(symbol, FNode) and symbol.is_symbol()):
-                continue
+        layout: dict[str, tuple[str, list[int], bool, int]] = {}
+        for name, symbol in symbols.items():
             indices = [int(i) for i in list_index_pattern.findall(name)]
             array_name = _safe(list_index_pattern.sub("", name))
             if array_name not in array_types:
@@ -715,16 +68,19 @@ class GenericTransitionSystem:
                     element_type = ArrayType(INT, element_type)
                 array_types[array_name] = ArrayType(INT, element_type)
             vp = self.profile.variables.get(name)
-            layout[name] = (array_name, indices,
-                            bool(vp and vp.is_list),
-                            vp.list_len if (vp and vp.is_list) else 0)
+            layout[name] = (
+                array_name,
+                indices,
+                bool(vp and vp.is_list),
+                vp.list_len if vp and vp.is_list else 0,
+            )
 
         owners: dict[str, int] = {}
-        for entry in layout.values():
-            owners[entry[0]] = owners.get(entry[0], 0) + 1
+        for array_name, _, _, _ in layout.values():
+            owners[array_name] = owners.get(array_name, 0) + 1
 
         def select_str(name: str, step: int) -> str:
-            array_name, indices, _is_list, _length = layout[name]
+            array_name, indices, _, _ = layout[name]
             expr = f"(select {array_name} {step})"
             for index in indices:
                 expr = f"(select {expr} {index})"
@@ -732,46 +88,57 @@ class GenericTransitionSystem:
 
         steps = min(bound + 1, len(self.trace))
         const_once: set[str] = set()
-
-        with open(path, "w") as f:
-            f.write("(set-logic ALL)\n")
+        with open(path, "w") as output:
+            output.write("(set-logic ALL)\n")
             for array_name, ty in array_types.items():
-                f.write(f"(declare-fun {array_name} () {_smt_sort(ty)})\n")
+                output.write(f"(declare-fun {array_name} () {_smt_sort(ty)})\n")
             for name in self.derivations:
-                f.write(f"(declare-fun {name} () (Array Int Real))\n")
+                output.write(f"(declare-fun {name} () (Array Int Real))\n")
 
-            # a constant array fixes every step in one assertion 
-            for name, val in self.constants.items():
+            for name, value in self.constants.items():
                 entry = layout.get(name)
                 if entry is None or entry[1] or owners[entry[0]] != 1:
                     continue
                 sort = _smt_sort(array_types[entry[0]])
-                f.write(f"(assert (= {entry[0]} ((as const {sort}) {_real_str(val)})))\n")
+                output.write(
+                    f"(assert (= {entry[0]} ((as const {sort}) {_real_str(value)})))\n"
+                )
                 const_once.add(name)
 
-            for i in range(steps):
-                row = self.trace[i]
+            for index, row in enumerate(self.trace[:steps]):
                 for name in self.var_names:
                     if name in const_once or name not in row:
                         continue
                     vp = self.profile.variables[name]
-                    val = row[name]
+                    value = row[name]
                     if vp.is_list:
-                        if isinstance(val, tuple):
-                            base = select_str(name, i)
-                            for j, element in enumerate(val):
-                                if not _is_nan(element):
-                                    f.write(f"(assert (= (select {base} {j}) {_real_str(float(element))}))\n")
-                    elif not _is_nan(val) and not isinstance(val, str):
-                        f.write(f"(assert (= {select_str(name, i)} {_real_str(float(val))}))\n")
+                        if isinstance(value, tuple):
+                            base = select_str(name, index)
+                            for item_index, item in enumerate(value):
+                                if not _is_nan(item):
+                                    output.write(
+                                        f"(assert (= (select {base} {item_index}) "
+                                        f"{_real_str(float(item))}))\n"
+                                    )
+                    elif not _is_nan(value) and not isinstance(value, str):
+                        output.write(
+                            f"(assert (= {select_str(name, index)} "
+                            f"{_real_str(float(value))}))\n"
+                        )
                 if self.model_time and "timestamp" in row:
-                    f.write(f"(assert (= {select_str('timestamp', i)} {_real_str(row['timestamp'])}))\n")
+                    output.write(
+                        f"(assert (= {select_str('timestamp', index)} "
+                        f"{_real_str(row['timestamp'])}))\n"
+                    )
                 for name, fn in self.derivations.items():
                     try:
-                        val = fn(self.trace, i)
+                        value = fn(self.trace, index)
                     except (KeyError, TypeError, ZeroDivisionError, IndexError, ValueError):
-                        val = None
-                    if val is not None and not _is_nan(val):
-                        f.write(f"(assert (= (select {name} {i}) {_real_str(float(val))}))\n")
+                        value = None
+                    if value is not None and not _is_nan(value):
+                        output.write(
+                            f"(assert (= (select {name} {index}) "
+                            f"{_real_str(float(value))}))\n"
+                        )
 
-            f.write("(check-sat)\n(get-model)\n")
+            output.write("(check-sat)\n(get-model)\n")

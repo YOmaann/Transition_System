@@ -13,9 +13,8 @@ import sys
 import time
 
 from trace import ArrayMode, TraceOptions
-from pipeline import from_json, run_standard_checks
+from pipeline import from_json
 def _process_trace(task: tuple):
-    """Run one trace in an isolated process and return its captured report."""
     path, output, array_mode, max_list_items, bound_arg, property_mode, property_file = task
     report = StringIO()
     try:
@@ -46,7 +45,6 @@ def _process_trace(task: tuple):
                 stats = compile_property(ts, Path(property_file), Path(output))
                 return path, [stats], None
             bound = bound_arg if bound_arg is not None else ts.profile.num_steps - 1
-            run_standard_checks(ts, bound=bound)
             ts.to_smtlib(output, bound=bound)
             print(f"done: wrote {output}")
         return path, report.getvalue(), None
@@ -58,8 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="main.py",
         description=(
-            "Convert a generic JSON trace into a transition system, run checks, "
-            "and export the concrete trace to SMT-LIB."
+            "Convert a generic JSON trace and export it to SMT-LIB."
         ),
     )
     parser.add_argument(
@@ -117,12 +114,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Max number of items to keep when flattening lists (0 = unbounded, keep all; default: 0).",
-    )
-    parser.add_argument(
-        "--standard-checks",
-        action="store_true",
-        help="Run the built-in standard checks (safety, monotonicity, liveness, "
-             "reachability) instead of the example speed check.",
     )
     return parser.parse_args(argv)
 
@@ -221,65 +212,17 @@ def main(argv: list[str] | None = None) -> None:
         stats = compile_property(ts, Path(args.property_file), Path(args.output))
         print(f"{stats['property']}: checked={stats['checked_steps']} "
               f"missing={stats['missing_steps']} non_finite={stats['non_finite_steps']} "
-              f"violations={stats['violating_steps']} query={stats['smt_file']}")
+              f"query={stats['smt_file']}")
+        if stats["witness_smt_file"]:
+            print(f"witness query={stats['witness_smt_file']}")
         return
     ts = from_json(args.path, opts=opts)
 
     bound = args.bound if args.bound is not None else ts.profile.num_steps - 1
 
-    if args.standard_checks:
-        run_standard_checks(ts, bound=bound)
     ts.to_smtlib(args.output, bound=bound)
     print(f"done: wrote {args.output}")
 
 
 if __name__ == "__main__":
     main()
-
-# CVC
-# s = x_0, x_1 ,....
-# And(x_0 > 0, x_1 > 0...) - enough
-# \forall i, x_[i] > 0
-# Array (for comparison purpose)
-# z3 : sort - type of types.
-
-# does it speed up verification ? 
-# x' - x > 10
-# \exists i, t = i and t' = i + 1 -> cannot check for path. 
-# comparison.
-# look for encoding variations.
-
-# documentation - high level (todo/ slides)
-# workflow (diagram/walkthrough)
-# toolchains (PySMT, z3 briefly)
-
-# concrete examples
-# precision of the perceived bus (predicted path)
-
-# TOD
-# how to make propositions for perception location adn so on.
-# planning has collision with predict part. 
-# based on the photo.
-# delays
-# fault tree analysis
-# root cause analysis - keep track of time. 
-# query language - to  bench capabilities of the encoding.
-
-# symbolic value which captures the index.
-# independent property.
-# array - upper and lower bound for arrays.
-# convert (/ a b) to reals.
-# metadatas as constants.
-# try cvc solver and other solvers.
-# add number of clauses in the table, times and memory usage.
-
-
-# two modes to add constraints in the encoding (trigger derived conversion or not).
-# ghost variables - projection - 1. drop unrequired variables, 2. dervied variable by precomputing in python.
-# can use python eval function
-# keyword - partial assignment for smt solvers.
-# verification using programming language
-# fix implementation
-# insight in case the implementation fails.
-# think about soundness.
-# accuracy of predict path with the range.
