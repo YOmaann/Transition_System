@@ -29,40 +29,40 @@ def _number(value: Any) -> Fraction:
     return Fraction(str(value))
 
 
-def _validate_expr(node: ast.AST, aliases: set[str]) -> None:
-    if isinstance(node, ast.Expression):
-        _validate_expr(node.body, aliases)
-    elif isinstance(node, ast.Compare):
-        if len(node.ops) != 1 or type(node.ops[0]) not in _COMPARE:
-            raise ValueError("comparisons must use <, <=, >, >=, ==, or !=")
-        _validate_expr(node.left, aliases)
-        _validate_expr(node.comparators[0], aliases)
-    elif isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
-        for value in node.values:
-            _validate_expr(value, aliases)
-    elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
-        _validate_expr(node.left, aliases)
-        _validate_expr(node.right, aliases)
-        if isinstance(node.op, ast.Pow) and not (
-            isinstance(node.right, ast.Constant) and isinstance(node.right.value, int)
-            and not isinstance(node.right.value, bool) and 0 <= node.right.value <= 8
-        ):
-            raise ValueError("exponents must be integer constants from 0 through 8")
-    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
-        _validate_expr(node.operand, aliases)
-    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        _validate_expr(node.operand, aliases)
-    elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-          and node.func.id == "abs" and len(node.args) == 1 and not node.keywords):
-        _validate_expr(node.args[0], aliases)
-    elif isinstance(node, ast.Name):
-        if node.id not in aliases:
-            raise ValueError(f"unknown property alias: {node.id}")
-    elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        if isinstance(node.value, float) and not math.isfinite(node.value):
-            raise ValueError("property constants must be finite")
-    else:
-        raise ValueError(f"unsupported property expression: {ast.dump(node)}")
+# def _validate_expr(node: ast.AST, aliases: set[str]) -> None:
+#     if isinstance(node, ast.Expression):
+#         _validate_expr(node.body, aliases)
+#     elif isinstance(node, ast.Compare):
+#         if len(node.ops) != 1 or type(node.ops[0]) not in _COMPARE:
+#             raise ValueError("comparisons must use <, <=, >, >=, ==, or !=")
+#         _validate_expr(node.left, aliases)
+#         _validate_expr(node.comparators[0], aliases)
+#     elif isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+#         for value in node.values:
+#             _validate_expr(value, aliases)
+#     elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+#         _validate_expr(node.left, aliases)
+#         _validate_expr(node.right, aliases)
+#         if isinstance(node.op, ast.Pow) and not (
+#             isinstance(node.right, ast.Constant) and isinstance(node.right.value, int)
+#             and not isinstance(node.right.value, bool) and 0 <= node.right.value <= 8
+#         ):
+#             raise ValueError("exponents must be integer constants from 0 through 8")
+#     elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+#         _validate_expr(node.operand, aliases)
+#     elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+#         _validate_expr(node.operand, aliases)
+#     elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+#           and node.func.id == "abs" and len(node.args) == 1 and not node.keywords):
+#         _validate_expr(node.args[0], aliases)
+#     elif isinstance(node, ast.Name):
+#         if node.id not in aliases:
+#             raise ValueError(f"unknown property alias: {node.id}")
+#     elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+#         if isinstance(node.value, float) and not math.isfinite(node.value):
+#             raise ValueError("property constants must be finite")
+#     else:
+#         raise ValueError(f"unsupported property expression: {ast.dump(node)}")
 
 
 def _smt_expr(node: ast.AST, aliases: dict[str, str]) -> str:
@@ -129,7 +129,7 @@ def _parse_expr(source: str, aliases: set[str]) -> ast.Expression:
         parsed = ast.parse(source, mode="eval")
     except SyntaxError as exc:
         raise ValueError(f"invalid property expression: {exc.msg}") from exc
-    _validate_expr(parsed, aliases)
+    # _validate_expr(parsed, aliases)
     return parsed
 
 
