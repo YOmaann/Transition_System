@@ -8,6 +8,17 @@ Convert JSON traces to SMT-LIB and check properties with Z3.
 pip install -r requirements.txt
 ```
 
+## Parameters
+
+- `path`: input JSON file; use a directory or glob with `--batch`.
+- `--output`, `-o`: output file, or output directory in batch mode.
+- `--bound`, `-b`: limit trace steps for regular SMT export.
+- `--property-file JSON`: compile a custom property from a JSON file.
+- `--array-mode`: choose `truncate` (default), `crossproduct`, or `intact`.
+- `--max-list-items N`: cap list lengths; `0` keeps every item.
+- `--batch`: process multiple JSON files; `--recursive` includes subfolders.
+- `--jobs N`: maximum number of batch jobs to run at once.
+
 ## Examples
 
 ```sh
@@ -18,10 +29,6 @@ python main.py example/cutin-json/cutin_sim16.json --array-mode intact --propert
 z3 output.smt2
 z3 output_witness.smt2
 ```
-
-Array modes: `truncate` limits list items; `crossproduct` expands list combinations; `intact` keeps lists as arrays.
-
-`--max-list-items 0` keeps all items; use `--array-mode intact` for array-indexed properties.
 
 ## Property example
 
