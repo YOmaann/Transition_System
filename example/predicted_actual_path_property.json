@@ -1,0 +1,14 @@
+{
+  "mappings": [
+    {"array": "planning_trajectory", "variable": "timestamp", "alias": "prediction_time"},
+    {"array": "planning_trajectory", "variable": "points[*].time_from_start", "alias": "point_dt"},
+    {"array": "planning_trajectory", "variable": "points[*].pose.position.x", "alias": "predicted_x"},
+    {"array": "planning_trajectory", "variable": "points[*].pose.position.y", "alias": "predicted_y"},
+    {"array": "groundtruth_kinematic", "variable": "timestamp", "alias": "actual_time"},
+    {"array": "groundtruth_kinematic", "variable": "groundtruth_ego.pose.position.x", "alias": "actual_x"},
+    {"array": "groundtruth_kinematic", "variable": "groundtruth_ego.pose.position.y", "alias": "actual_y"}
+  ],
+  "property": {
+    "expression": "forall(t_1, predicted_x, forall(t_2, actual_x, abs(prediction_time + point_dt[t_1] - actual_time[t_2]) > 0.05 or (predicted_x[t_1] - actual_x[t_2])**2 + (predicted_y[t_1] - actual_y[t_2])**2 <= 1.0))"
+  }
+}
